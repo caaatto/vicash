@@ -11,6 +11,7 @@ mod frame;
 #[cfg(windows)]
 mod h264_encoder;
 mod i18n;
+mod mpegts;
 mod perf;
 mod preview;
 mod relay;
