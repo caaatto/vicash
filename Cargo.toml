@@ -47,6 +47,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 ico = "0.4"
 ab_glyph = "0.2"
 
+[patch.crates-io]
+# Vendored copy of nokhwa-bindings-windows with one diff: the Media Foundation
+# source reader attribute MF_LOW_LATENCY is set to 1 before
+# MFCreateSourceReaderFromMediaSource. Saves about one to two frames of
+# buffering on capture cards that honour the hint.
+nokhwa-bindings-windows = { path = "vendor/nokhwa-bindings-windows" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

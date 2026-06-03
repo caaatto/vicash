@@ -1,5 +1,5 @@
 use crate::i18n::Language;
-use crate::settings::{FitMode, Settings};
+use crate::settings::{FitMode, PresentMode, Settings};
 use anyhow::Result;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,7 @@ pub struct DisplayConfig {
     pub fit_mode: FitModeIo,
     pub show_stats: bool,
     pub background_color: [f32; 3],
+    pub present_mode: PresentMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +100,7 @@ impl Default for Config {
                 fit_mode: s.fit_mode.into(),
                 show_stats: s.show_stats,
                 background_color: s.background_color,
+                present_mode: s.present_mode,
             },
             monitor: MonitorConfig {
                 fullscreen: s.fullscreen,
@@ -122,6 +124,7 @@ impl Default for DisplayConfig {
             fit_mode: s.fit_mode.into(),
             show_stats: s.show_stats,
             background_color: s.background_color,
+            present_mode: s.present_mode,
         }
     }
 }
@@ -225,6 +228,7 @@ pub fn settings_from_config(cfg: &Config) -> Settings {
         always_on_top: cfg.monitor.always_on_top,
         hide_cursor: cfg.monitor.hide_cursor,
         language: cfg.language,
+        present_mode: cfg.display.present_mode,
     }
 }
 
@@ -240,6 +244,7 @@ pub fn config_from_runtime(
             fit_mode: s.fit_mode.into(),
             show_stats: s.show_stats,
             background_color: s.background_color,
+            present_mode: s.present_mode,
         },
         monitor: MonitorConfig {
             fullscreen: s.fullscreen,

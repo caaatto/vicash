@@ -1,4 +1,4 @@
-use crate::frame::SharedFrame;
+use crate::frame::{FrameData, SharedFrame};
 use crate::settings::Settings;
 use anyhow::{Context, Result};
 use image::codecs::jpeg::JpegEncoder;
@@ -88,7 +88,8 @@ fn serve_snapshot(
         return Ok(());
     };
     let quality = settings.lock().jpeg_quality.clamp(1, 100);
-    let jpeg = encode_jpeg(&frame.rgb, frame.width, frame.height, quality)?;
+    let rgb = frame_to_rgb(&frame.data, frame.width, frame.height);
+    let jpeg = encode_jpeg(&rgb, frame.width, frame.height, quality)?;
     let header = Header::from_bytes(&b"Content-Type"[..], &b"image/jpeg"[..]).unwrap();
     request.respond(Response::from_data(jpeg).with_header(header))?;
     Ok(())
@@ -119,7 +120,8 @@ fn serve_mjpeg(
         };
         last_seq = frame.seq;
         let quality = settings.lock().jpeg_quality.clamp(1, 100);
-        let jpeg = encode_jpeg(&frame.rgb, frame.width, frame.height, quality)?;
+        let rgb = frame_to_rgb(&frame.data, frame.width, frame.height);
+        let jpeg = encode_jpeg(&rgb, frame.width, frame.height, quality)?;
         write!(
             writer,
             "--{BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
@@ -136,4 +138,47 @@ fn encode_jpeg(rgb: &[u8], w: u32, h: u32, quality: u8) -> Result<Vec<u8>> {
     let encoder = JpegEncoder::new_with_quality(&mut out, quality);
     encoder.write_image(rgb, w, h, ColorType::Rgb8.into())?;
     Ok(out)
+}
+
+/// Get an RGB byte slice from either a Rgb or Nv12 frame. For Rgb we just
+/// clone the Arc's bytes; for Nv12 we synthesise RGB via BT.709 limited-range
+/// YUV conversion. The relay path is opt-in and cold for most users, so this
+/// per-pixel CPU cost is acceptable here.
+fn frame_to_rgb(data: &FrameData, w: u32, h: u32) -> Vec<u8> {
+    match data {
+        FrameData::Rgb(b) => b.as_ref().clone(),
+        FrameData::Nv12(b) => nv12_to_rgb(b.as_ref(), w, h),
+    }
+}
+
+fn nv12_to_rgb(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    if nv12.len() < w * h * 3 / 2 {
+        return vec![0u8; w * h * 3];
+    }
+    let y_plane = &nv12[..w * h];
+    let uv_plane = &nv12[w * h..];
+    let mut rgb = vec![0u8; w * h * 3];
+    for row in 0..h {
+        let uv_row = row / 2;
+        for col in 0..w {
+            let uv_col = col & !1; // even-aligned pair
+            let y = y_plane[row * w + col] as f32;
+            let u = uv_plane[uv_row * w + uv_col] as f32;
+            let v = uv_plane[uv_row * w + uv_col + 1] as f32;
+            // BT.709 limited range
+            let yt = (y - 16.0) * (255.0 / 219.0);
+            let ut = (u - 128.0) * (255.0 / 224.0);
+            let vt = (v - 128.0) * (255.0 / 224.0);
+            let r = yt + 1.5748 * vt;
+            let g = yt - 0.1873 * ut - 0.4681 * vt;
+            let b = yt + 1.8556 * ut;
+            let idx = (row * w + col) * 3;
+            rgb[idx] = r.clamp(0.0, 255.0) as u8;
+            rgb[idx + 1] = g.clamp(0.0, 255.0) as u8;
+            rgb[idx + 2] = b.clamp(0.0, 255.0) as u8;
+        }
+    }
+    rgb
 }

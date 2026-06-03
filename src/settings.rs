@@ -13,6 +13,19 @@ pub struct Settings {
     pub always_on_top: bool,
     pub hide_cursor: bool,
     pub language: crate::i18n::Language,
+    pub present_mode: PresentMode,
+}
+
+/// Mirror of wgpu::PresentMode so the settings layer does not depend on wgpu
+/// types. The preview translates this into the wgpu enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PresentMode {
+    /// Lowest latency, no vsync, may tear.
+    Immediate,
+    /// Low latency, no tearing, requires HW support.
+    Mailbox,
+    /// Standard vsync, no tearing, slightly higher latency.
+    Fifo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +51,7 @@ impl Default for Settings {
             always_on_top: false,
             hide_cursor: true,
             language: crate::i18n::Language::default(),
+            present_mode: PresentMode::Mailbox,
         }
     }
 }

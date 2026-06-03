@@ -2,6 +2,7 @@ use crate::audio::AudioRuntime;
 use crate::capture::{CaptureController, CaptureRequest};
 use crate::i18n::{self, Language};
 use crate::perf::PerfMetrics;
+use crate::settings::PresentMode;
 use crate::frame::{Frame, SharedFrame, UiEvent};
 use crate::settings::{CaptureInfo, FitMode, Settings};
 use anyhow::{Context, Result, anyhow};
@@ -95,15 +96,49 @@ struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    /// Present modes the adapter actually supports; we offer only these in
+    /// the UI and clamp to Fifo if a chosen mode is unavailable.
+    supported_present_modes: Vec<wgpu::PresentMode>,
     sampler: wgpu::Sampler,
-    texture: Option<wgpu::Texture>,
-    bind_group: Option<wgpu::BindGroup>,
+    /// RGB pipeline: single Rgba8UnormSrgb texture, used when the capture
+    /// thread already gave us RGB pixels.
+    rgb_pipeline: wgpu::RenderPipeline,
+    rgb_bgl: wgpu::BindGroupLayout,
+    rgb_state: Option<RgbTexState>,
+    /// NV12 pipeline: two textures (Y as R8Unorm, UV as Rg8Unorm) and a
+    /// fragment shader that converts BT.709 YUV to RGB. Used when the device
+    /// hands us NV12 directly so we skip a CPU colour conversion.
+    nv12_pipeline: wgpu::RenderPipeline,
+    nv12_bgl: wgpu::BindGroupLayout,
+    nv12_state: Option<Nv12TexState>,
+    /// Which pipeline produced the last successful texture upload, so render
+    /// knows what to draw. Reset when the frame size changes.
+    active: ActivePipeline,
     vertex_buffer: wgpu::Buffer,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum ActivePipeline {
+    #[default]
+    None,
+    Rgb,
+    Nv12,
+}
+
+struct RgbTexState {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
+struct Nv12TexState {
+    y_texture: wgpu::Texture,
+    uv_texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    size: (u32, u32),
 }
 
 #[repr(C)]
@@ -113,7 +148,7 @@ struct Vertex {
     uv: [f32; 2],
 }
 
-const SHADER: &str = r#"
+const RGB_SHADER: &str = r#"
 struct VsIn {
     @location(0) pos: vec2<f32>,
     @location(1) uv:  vec2<f32>,
@@ -136,6 +171,57 @@ fn vs_main(in: VsIn) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return textureSample(tex, samp, in.uv);
+}
+"#;
+
+/// NV12 fragment shader. Two textures: Y plane (R8Unorm at full resolution)
+/// and UV plane (Rg8Unorm at half resolution). Converts BT.709 limited-range
+/// YUV to RGB right at the fragment, then applies the sRGB EOTF so the
+/// sRGB-aware surface storage matches the RGB pipeline. Without the gamma
+/// step the colours come out washed because the surface re-applies a sRGB
+/// curve on linear-treated gamma-encoded data.
+const NV12_SHADER: &str = r#"
+struct VsIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) uv:  vec2<f32>,
+};
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = vec4<f32>(in.pos, 0.0, 1.0);
+    out.uv = in.uv;
+    return out;
+}
+
+@group(0) @binding(0) var y_tex: texture_2d<f32>;
+@group(0) @binding(1) var uv_tex: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+fn srgb_to_linear(c: f32) -> f32 {
+    let cl = clamp(c, 0.0, 1.0);
+    if (cl <= 0.04045) {
+        return cl / 12.92;
+    }
+    return pow((cl + 0.055) / 1.055, 2.4);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let y = textureSample(y_tex, samp, in.uv).r;
+    let uv = textureSample(uv_tex, samp, in.uv).rg;
+    // BT.709 limited range YUV -> sRGB-encoded RGB
+    let yt = (y - 16.0 / 255.0) * (255.0 / 219.0);
+    let ut = (uv.r - 128.0 / 255.0) * (255.0 / 224.0);
+    let vt = (uv.g - 128.0 / 255.0) * (255.0 / 224.0);
+    let r = yt + 1.5748 * vt;
+    let g = yt - 0.1873 * ut - 0.4681 * vt;
+    let b = yt + 1.8556 * ut;
+    // Decode sRGB to linear; the sRGB-aware surface will re-encode on store.
+    return vec4<f32>(srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0);
 }
 "#;
 
@@ -328,17 +414,13 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
         .copied()
         .find(|f| f.is_srgb())
         .unwrap_or(caps.formats[0]);
-    let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-        wgpu::PresentMode::Mailbox
-    } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
-        wgpu::PresentMode::Immediate
-    } else {
-        wgpu::PresentMode::Fifo
-    };
+    let supported_present_modes: Vec<wgpu::PresentMode> = caps.present_modes.iter().copied().collect();
+    let present_mode = pick_present_mode(PresentMode::Mailbox, &supported_present_modes);
     log::info!(
-        "wgpu adapter: {:?}, format: {:?}, present: {:?}",
+        "wgpu adapter: {:?}, format: {:?}, present modes: {:?}, default: {:?}",
         adapter.get_info().name,
         format,
+        supported_present_modes,
         present_mode
     );
 
@@ -354,13 +436,17 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
     };
     surface.configure(&device, &config);
 
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("vcshare-shader"),
-        source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+    let rgb_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("vcshare-rgb-shader"),
+        source: wgpu::ShaderSource::Wgsl(RGB_SHADER.into()),
+    });
+    let nv12_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("vcshare-nv12-shader"),
+        source: wgpu::ShaderSource::Wgsl(NV12_SHADER.into()),
     });
 
-    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("vcshare-bgl"),
+    let rgb_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("vcshare-rgb-bgl"),
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -380,18 +466,54 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
             },
         ],
     });
+    let nv12_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("vcshare-nv12-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
 
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("vcshare-pl"),
-        bind_group_layouts: &[&bind_group_layout],
+    let rgb_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("vcshare-rgb-pl"),
+        bind_group_layouts: &[&rgb_bgl],
+        push_constant_ranges: &[],
+    });
+    let nv12_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("vcshare-nv12-pl"),
+        bind_group_layouts: &[&nv12_bgl],
         push_constant_ranges: &[],
     });
 
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("vcshare-pipeline"),
-        layout: Some(&pipeline_layout),
+    let rgb_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("vcshare-rgb-pipeline"),
+        layout: Some(&rgb_pipeline_layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: &rgb_shader,
             entry_point: Some("vs_main"),
             buffers: &[wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<Vertex>() as u64,
@@ -401,7 +523,7 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: &rgb_shader,
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
@@ -447,17 +569,51 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
     );
     let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
 
+    let nv12_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("vcshare-nv12-pipeline"),
+        layout: Some(&nv12_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &nv12_shader,
+            entry_point: Some("vs_main"),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<Vertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+            }],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &nv12_shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: config.format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    });
+
     Ok(Gpu {
         window,
         surface,
         device,
         queue,
         config,
-        pipeline,
-        bind_group_layout,
+        supported_present_modes,
         sampler,
-        texture: None,
-        bind_group: None,
+        rgb_pipeline,
+        rgb_bgl,
+        rgb_state: None,
+        nv12_pipeline,
+        nv12_bgl,
+        nv12_state: None,
+        active: ActivePipeline::None,
         vertex_buffer,
         egui_ctx,
         egui_state,
@@ -465,15 +621,48 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
     })
 }
 
+fn pick_present_mode(want: PresentMode, supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    let candidate = match want {
+        PresentMode::Immediate => wgpu::PresentMode::Immediate,
+        PresentMode::Mailbox => wgpu::PresentMode::Mailbox,
+        PresentMode::Fifo => wgpu::PresentMode::Fifo,
+    };
+    if supported.contains(&candidate) {
+        candidate
+    } else {
+        // Fall back through the cheapest still-supported alternative.
+        for fb in [
+            wgpu::PresentMode::Mailbox,
+            wgpu::PresentMode::Immediate,
+            wgpu::PresentMode::Fifo,
+        ] {
+            if supported.contains(&fb) {
+                return fb;
+            }
+        }
+        wgpu::PresentMode::Fifo
+    }
+}
+
 fn upload_frame(gpu: &mut Gpu, frame: &Frame, current: &mut (u32, u32)) {
-    if *current != (frame.width, frame.height) || gpu.texture.is_none() {
+    match &frame.data {
+        crate::frame::FrameData::Rgb(rgb) => {
+            upload_rgb(gpu, frame.width, frame.height, rgb.as_slice(), current);
+            gpu.active = ActivePipeline::Rgb;
+        }
+        crate::frame::FrameData::Nv12(nv12) => {
+            upload_nv12(gpu, frame.width, frame.height, nv12.as_slice(), current);
+            gpu.active = ActivePipeline::Nv12;
+        }
+    }
+}
+
+fn upload_rgb(gpu: &mut Gpu, w: u32, h: u32, rgb: &[u8], current: &mut (u32, u32)) {
+    let needs_realloc = gpu.rgb_state.as_ref().map(|s| s.size != (w, h)).unwrap_or(true);
+    if needs_realloc {
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("vcshare-frame-tex"),
-            size: wgpu::Extent3d {
-                width: frame.width,
-                height: frame.height,
-                depth_or_array_layers: 1,
-            },
+            label: Some("vcshare-rgb-tex"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -483,28 +672,20 @@ fn upload_frame(gpu: &mut Gpu, frame: &Frame, current: &mut (u32, u32)) {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("vcshare-bg"),
-            layout: &gpu.bind_group_layout,
+            label: Some("vcshare-rgb-bg"),
+            layout: &gpu.rgb_bgl,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&gpu.sampler),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&gpu.sampler) },
             ],
         });
-        gpu.texture = Some(texture);
-        gpu.bind_group = Some(bind_group);
-        *current = (frame.width, frame.height);
+        gpu.rgb_state = Some(RgbTexState { texture, bind_group, size: (w, h) });
     }
-    let rgba = rgb_to_rgba(&frame.rgb);
-    let texture = gpu.texture.as_ref().expect("texture initialized above");
+    let rgba = rgb_to_rgba(rgb);
+    let state = gpu.rgb_state.as_ref().expect("rgb texture initialized above");
     gpu.queue.write_texture(
         wgpu::ImageCopyTexture {
-            texture,
+            texture: &state.texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
@@ -512,15 +693,85 @@ fn upload_frame(gpu: &mut Gpu, frame: &Frame, current: &mut (u32, u32)) {
         &rgba,
         wgpu::ImageDataLayout {
             offset: 0,
-            bytes_per_row: Some(4 * frame.width),
-            rows_per_image: Some(frame.height),
+            bytes_per_row: Some(4 * w),
+            rows_per_image: Some(h),
         },
-        wgpu::Extent3d {
-            width: frame.width,
-            height: frame.height,
-            depth_or_array_layers: 1,
-        },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
     );
+    *current = (w, h);
+}
+
+fn upload_nv12(gpu: &mut Gpu, w: u32, h: u32, nv12: &[u8], current: &mut (u32, u32)) {
+    let needs_realloc = gpu.nv12_state.as_ref().map(|s| s.size != (w, h)).unwrap_or(true);
+    if needs_realloc {
+        let y_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("vcshare-nv12-y-tex"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let uv_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("vcshare-nv12-uv-tex"),
+            size: wgpu::Extent3d { width: w / 2, height: h / 2, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let uv_view = uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vcshare-nv12-bg"),
+            layout: &gpu.nv12_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&gpu.sampler) },
+            ],
+        });
+        gpu.nv12_state = Some(Nv12TexState { y_texture, uv_texture, bind_group, size: (w, h) });
+    }
+    let y_len = (w as usize) * (h as usize);
+    let state = gpu.nv12_state.as_ref().expect("nv12 textures initialized above");
+    // Y plane: full resolution, one byte per sample.
+    gpu.queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &state.y_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &nv12[..y_len],
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(w),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    // UV plane: half resolution, two bytes per sample (interleaved U,V).
+    gpu.queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &state.uv_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &nv12[y_len..],
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(w),
+            rows_per_image: Some(h / 2),
+        },
+        wgpu::Extent3d { width: w / 2, height: h / 2, depth_or_array_layers: 1 },
+    );
+    *current = (w, h);
 }
 
 fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
@@ -544,6 +795,14 @@ fn render_frame(
     pending: &mut Option<PendingCapture>,
     metrics: &Arc<PerfMetrics>,
 ) -> Result<()> {
+    // Apply present-mode changes from the F1 panel by reconfiguring the
+    // surface only when the chosen mode actually differs.
+    let desired = pick_present_mode(settings.present_mode, &gpu.supported_present_modes);
+    if desired != gpu.config.present_mode {
+        gpu.config.present_mode = desired;
+        gpu.surface.configure(&gpu.device, &gpu.config);
+    }
+
     // Update vertex buffer for current fit mode.
     let (qx, qy) = quad_scale(
         settings.fit_mode,
@@ -620,11 +879,24 @@ fn render_frame(
                 occlusion_query_set: None,
             })
             .forget_lifetime();
-        if let Some(bind_group) = gpu.bind_group.as_ref() {
-            rp.set_pipeline(&gpu.pipeline);
-            rp.set_bind_group(0, bind_group, &[]);
-            rp.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
-            rp.draw(0..6, 0..1);
+        match gpu.active {
+            ActivePipeline::Rgb => {
+                if let Some(state) = gpu.rgb_state.as_ref() {
+                    rp.set_pipeline(&gpu.rgb_pipeline);
+                    rp.set_bind_group(0, &state.bind_group, &[]);
+                    rp.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
+                    rp.draw(0..6, 0..1);
+                }
+            }
+            ActivePipeline::Nv12 => {
+                if let Some(state) = gpu.nv12_state.as_ref() {
+                    rp.set_pipeline(&gpu.nv12_pipeline);
+                    rp.set_bind_group(0, &state.bind_group, &[]);
+                    rp.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
+                    rp.draw(0..6, 0..1);
+                }
+            }
+            ActivePipeline::None => {}
         }
         gpu.egui_renderer.render(&mut rp, &primitives, &screen_desc);
     }
@@ -721,6 +993,29 @@ fn build_ui(
                                 ui.selectable_value(&mut settings.fit_mode, FitMode::Stretch, t.fit_stretch);
                                 ui.selectable_value(&mut settings.fit_mode, FitMode::Fit, t.fit_fit);
                                 ui.selectable_value(&mut settings.fit_mode, FitMode::Fill, t.fit_fill);
+                            });
+                        egui::ComboBox::from_label(t.present_mode)
+                            .selected_text(match settings.present_mode {
+                                PresentMode::Immediate => t.present_immediate,
+                                PresentMode::Mailbox => t.present_mailbox,
+                                PresentMode::Fifo => t.present_fifo,
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut settings.present_mode,
+                                    PresentMode::Immediate,
+                                    t.present_immediate,
+                                );
+                                ui.selectable_value(
+                                    &mut settings.present_mode,
+                                    PresentMode::Mailbox,
+                                    t.present_mailbox,
+                                );
+                                ui.selectable_value(
+                                    &mut settings.present_mode,
+                                    PresentMode::Fifo,
+                                    t.present_fifo,
+                                );
                             });
                         ui.checkbox(&mut settings.show_stats, t.show_stats);
                         ui.horizontal(|ui| {

@@ -1,4 +1,4 @@
-use crate::frame::{Frame, SharedFrame, UiEvent};
+use crate::frame::{Frame, FrameData, SharedFrame, UiEvent};
 use anyhow::{Context, Result, anyhow, bail};
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{
@@ -214,15 +214,22 @@ fn run_once(
         .context("failed to apply chosen capture format")?;
     cam.open_stream().context("failed to start capture stream")?;
 
+    // Fast path: if the device gives us NV12 directly, we skip nokhwa's
+    // CPU NV12->RGB decode and ship the raw planes straight to the GPU. The
+    // shader does the YUV->RGB on the fly. Half the memory bandwidth and no
+    // CPU colour conversion in the hot path.
+    let is_nv12 = chosen.format() == FrameFormat::NV12;
+    let expected_nv12_len = chosen.resolution().width() as usize
+        * chosen.resolution().height() as usize
+        * 3
+        / 2;
+
     let mut seq: u64 = 0;
     let mut decode_fails: u64 = 0;
     let mut last_warn = Instant::now();
     let mut frames_since_log: u64 = 0;
     let mut last_log = Instant::now();
     loop {
-        // Check for restart / stop before each frame so the thread responds
-        // promptly to the F1 panel without dropping signal in the middle of
-        // a frame read.
         match cmd_rx.try_recv() {
             Ok(CaptureCommand::Restart(new_req)) => {
                 log::info!("capture restart requested");
@@ -244,27 +251,52 @@ fn run_once(
                 continue;
             }
         };
-        let decoded = match buf.decode_image::<RgbFormat>() {
-            Ok(d) => d,
-            Err(e) => {
+
+        let (w, h);
+        let frame_data;
+        if is_nv12 {
+            let raw = buf.buffer();
+            if raw.len() < expected_nv12_len {
                 decode_fails += 1;
                 if last_warn.elapsed() >= Duration::from_secs(5) {
                     log::warn!(
-                        "{decode_fails} decode failures in the last interval, last: {e}"
+                        "{decode_fails} short NV12 frames in the last interval, got {}, expected {}",
+                        raw.len(), expected_nv12_len
                     );
                     last_warn = Instant::now();
                     decode_fails = 0;
                 }
                 continue;
             }
-        };
-        let (w, h) = (decoded.width(), decoded.height());
-        let rgb = decoded.into_raw();
-        if rgb.len() != (w as usize) * (h as usize) * 3 {
-            return Err(anyhow!("unexpected frame size: {} bytes for {}x{}", rgb.len(), w, h));
+            w = chosen.resolution().width();
+            h = chosen.resolution().height();
+            frame_data = FrameData::Nv12(Arc::new(raw[..expected_nv12_len].to_vec()));
+        } else {
+            let decoded = match buf.decode_image::<RgbFormat>() {
+                Ok(d) => d,
+                Err(e) => {
+                    decode_fails += 1;
+                    if last_warn.elapsed() >= Duration::from_secs(5) {
+                        log::warn!(
+                            "{decode_fails} decode failures in the last interval, last: {e}"
+                        );
+                        last_warn = Instant::now();
+                        decode_fails = 0;
+                    }
+                    continue;
+                }
+            };
+            w = decoded.width();
+            h = decoded.height();
+            let rgb = decoded.into_raw();
+            if rgb.len() != (w as usize) * (h as usize) * 3 {
+                return Err(anyhow!("unexpected frame size: {} bytes for {}x{}", rgb.len(), w, h));
+            }
+            frame_data = FrameData::Rgb(Arc::new(rgb));
         }
+
         seq = seq.wrapping_add(1);
-        sink.publish(Frame { width: w, height: h, rgb: Arc::new(rgb), seq });
+        sink.publish(Frame { width: w, height: h, data: frame_data, seq });
         if let Some(n) = notifier {
             let _ = n.send_event(UiEvent::FrameReady);
         }

@@ -1,15 +1,22 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-/// One decoded RGB frame from the capture device.
+/// One frame from the capture device. The data payload is one of:
+///   - Rgb: tightly packed RGB8, length = width * height * 3
+///   - Nv12: Y plane followed by interleaved UV plane, length = width * height * 3 / 2
 #[derive(Clone)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    /// Tightly packed RGB8, length = width * height * 3.
-    pub rgb: Arc<Vec<u8>>,
+    pub data: FrameData,
     /// Monotonic counter, increments each time the capture thread publishes.
     pub seq: u64,
+}
+
+#[derive(Clone)]
+pub enum FrameData {
+    Rgb(Arc<Vec<u8>>),
+    Nv12(Arc<Vec<u8>>),
 }
 
 /// Event sent from background threads to wake the winit event loop. Currently
