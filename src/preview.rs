@@ -341,7 +341,9 @@ impl ApplicationHandler<UiEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let mut last_captured: Option<std::time::Instant> = None;
                 if let Some(f) = self.shared.get() {
+                    last_captured = Some(f.captured_at);
                     if f.seq != self.last_seq {
                         self.last_seq = f.seq;
                         upload_frame(gpu, &f, &mut self.tex_size);
@@ -367,6 +369,11 @@ impl ApplicationHandler<UiEvent> for App {
                 // Write back any settings the user changed in the panel.
                 *self.settings.lock() = settings;
                 self.pending_capture = pending;
+
+                // End-to-end latency: how old was the frame we just presented.
+                if let Some(ts) = last_captured {
+                    self.metrics.latency.record_pipeline(ts.elapsed());
+                }
 
                 tick_fps_log(&mut self.last_log, &mut self.frames_since_log, &mut self.preview_fps);
             }
@@ -1065,6 +1072,16 @@ fn build_ui(
                             sys.total_memory_mb
                         ));
                         ui.label(format!("{} {:.1} fps", t.perf_preview, preview_fps));
+                        ui.label(format!(
+                            "{} {:.1} ms",
+                            t.perf_pipeline_latency,
+                            metrics.latency.pipeline_ms()
+                        ));
+                        ui.label(format!(
+                            "{} {:.1} ms",
+                            t.perf_capture_interval,
+                            metrics.latency.capture_interval_ms()
+                        ));
                     });
 
                 ui.separator();
@@ -1072,9 +1089,20 @@ fn build_ui(
                     egui::Color32::from_rgb(180, 180, 180),
                     t.footer_note,
                 );
-                if ui.button(t.close).clicked() {
-                    settings.show_panel = false;
-                }
+                ui.horizontal(|ui| {
+                    if ui.button(t.close).clicked() {
+                        settings.show_panel = false;
+                    }
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(140, 140, 140),
+                                format!("vicash v{}", env!("CARGO_PKG_VERSION")),
+                            );
+                        },
+                    );
+                });
             });
     }
 }

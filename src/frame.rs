@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// One frame from the capture device. The data payload is one of:
 ///   - Rgb: tightly packed RGB8, length = width * height * 3
@@ -11,6 +12,9 @@ pub struct Frame {
     pub data: FrameData,
     /// Monotonic counter, increments each time the capture thread publishes.
     pub seq: u64,
+    /// Wall-clock instant the frame was published by the capture thread.
+    /// Used by the renderer to derive end-to-end pipeline latency.
+    pub captured_at: Instant,
 }
 
 #[derive(Clone)]

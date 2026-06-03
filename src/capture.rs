@@ -145,6 +145,7 @@ pub fn spawn(
     req: CaptureRequest,
     sink: SharedFrame,
     notifier: Option<EventLoopProxy<UiEvent>>,
+    metrics: Arc<crate::perf::PerfMetrics>,
 ) -> Result<CaptureController> {
     let state = Arc::new(CaptureState::new());
     let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -152,7 +153,8 @@ pub fn spawn(
     let handle = thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
-            if let Err(e) = run(req, sink, notifier, state_for_thread, cmd_rx) {
+            crate::threadprio::bump_capture_thread();
+            if let Err(e) = run(req, sink, notifier, state_for_thread, cmd_rx, metrics) {
                 log::error!("capture thread exited: {e:#}");
             }
         })?;
@@ -165,10 +167,11 @@ fn run(
     notifier: Option<EventLoopProxy<UiEvent>>,
     state: Arc<CaptureState>,
     cmd_rx: Receiver<CaptureCommand>,
+    metrics: Arc<crate::perf::PerfMetrics>,
 ) -> Result<()> {
     let mut current_req = initial_req;
     loop {
-        match run_once(&current_req, &sink, notifier.as_ref(), &state, &cmd_rx)? {
+        match run_once(&current_req, &sink, notifier.as_ref(), &state, &cmd_rx, &metrics)? {
             LoopExit::Restart(new_req) => {
                 current_req = new_req;
                 // MSMF needs a beat between close and reopen on cheap cards.
@@ -190,6 +193,7 @@ fn run_once(
     notifier: Option<&EventLoopProxy<UiEvent>>,
     state: &Arc<CaptureState>,
     cmd_rx: &Receiver<CaptureCommand>,
+    metrics: &Arc<crate::perf::PerfMetrics>,
 ) -> Result<LoopExit> {
     let placeholder = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
     let index = CameraIndex::Index(req.device_index);
@@ -296,7 +300,14 @@ fn run_once(
         }
 
         seq = seq.wrapping_add(1);
-        sink.publish(Frame { width: w, height: h, data: frame_data, seq });
+        metrics.latency.mark_capture();
+        sink.publish(Frame {
+            width: w,
+            height: h,
+            data: frame_data,
+            seq,
+            captured_at: Instant::now(),
+        });
         if let Some(n) = notifier {
             let _ = n.send_event(UiEvent::FrameReady);
         }
@@ -362,13 +373,20 @@ fn matches_request(f: &CameraFormat, req: &CaptureRequest) -> bool {
 }
 
 /// Lower score wins. Strict total order: pixel format, then smoothness class,
-/// then fps descending, then closeness to 1080p.
+/// then fps descending, then closeness to 720p.
+///
+/// Why 720p as target and not 1080p: cheap USB capture cards routinely
+/// advertise 1080p60 modes that the USB pipe cannot actually sustain, so the
+/// device falls back to 30 fps once you start streaming. 720p60 sits well
+/// within the bandwidth budget of even fake-USB3 cards and matches the
+/// native output of the most common console (Switch). Users on hardware
+/// that can do real 1080p60 can override via the F1 panel.
 fn format_priority(a: &CameraFormat, b: &CameraFormat) -> std::cmp::Ordering {
     pixel_priority(a.format())
         .cmp(&pixel_priority(b.format()))
         .then_with(|| smooth_class(a.frame_rate()).cmp(&smooth_class(b.frame_rate())))
         .then_with(|| b.frame_rate().cmp(&a.frame_rate()))
-        .then_with(|| res_distance(a, 1920, 1080).cmp(&res_distance(b, 1920, 1080)))
+        .then_with(|| res_distance(a, 1280, 720).cmp(&res_distance(b, 1280, 720)))
 }
 
 fn smooth_class(fps: u32) -> u8 {

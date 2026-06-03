@@ -73,6 +73,7 @@ pub mod wmf {
                     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_LOW_LATENCY,
                     MF_MT_FRAME_RATE, MF_MT_FRAME_RATE_RANGE_MAX, MF_MT_FRAME_RATE_RANGE_MIN,
                     MF_MT_FRAME_SIZE, MF_MT_SUBTYPE, MF_READWRITE_DISABLE_CONVERTERS,
+                    MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_DISABLE_DXVA,
                 },
             },
             System::Com::{CoInitializeEx, CoUninitialize, COINIT},
@@ -490,6 +491,28 @@ pub mod wmf {
                                 value: 1.to_string(),
                                 error: why.to_string(),
                             });
+                        }
+
+                        // Disable DXVA video acceleration on the source
+                        // reader. DXVA adds a hardware-backed processing queue
+                        // that smooths but lags. We render in wgpu ourselves
+                        // from raw NV12, so we want the rawest frames the
+                        // device can give us with no hidden pipeline behind
+                        // them.
+                        if let Err(why) = unsafe {
+                            attr.SetUINT32(&MF_SOURCE_READER_DISABLE_DXVA, 1)
+                        } {
+                            return Err(NokhwaError::SetPropertyError {
+                                property: "MF_SOURCE_READER_DISABLE_DXVA".to_string(),
+                                value: 1.to_string(),
+                                error: why.to_string(),
+                            });
+                        }
+                        // Also make sure no D3D manager is set on the reader;
+                        // some drivers default to one and that re-enables a
+                        // hardware processing path.
+                        unsafe {
+                            let _ = attr.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, None);
                         }
 
                         attr

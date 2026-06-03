@@ -13,6 +13,7 @@ mod perf;
 mod preview;
 mod relay;
 mod settings;
+mod threadprio;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -88,6 +89,10 @@ struct Cli {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // Main thread runs the render / event loop, so raise its priority before
+    // anything else schedules.
+    threadprio::bump_render_thread();
+
     let cli = Cli::parse();
 
     if cli.list {
@@ -162,8 +167,11 @@ fn main() -> Result<()> {
         (Some(el), Some(proxy))
     };
 
+    let metrics = perf::PerfMetrics::new();
+    perf::spawn_sampler(metrics.clone());
+
     let capture_ctrl = Arc::new(
-        capture::spawn(request, shared.clone(), notifier)
+        capture::spawn(request, shared.clone(), notifier, metrics.clone())
             .context("failed to start capture thread")?
     );
 
@@ -216,9 +224,6 @@ fn main() -> Result<()> {
         capture_ctrl.clone(),
         audio_runtime.as_ref().map(|rt| rt.state.clone()),
     );
-
-    let metrics = perf::PerfMetrics::new();
-    perf::spawn_sampler(metrics.clone());
 
     match event_loop {
         None => {
