@@ -14,6 +14,8 @@ pub struct Settings {
     pub hide_cursor: bool,
     pub language: crate::i18n::Language,
     pub present_mode: PresentMode,
+    pub relay_port: u16,
+    pub relay_autostart: bool,
 }
 
 /// Mirror of wgpu::PresentMode so the settings layer does not depend on wgpu
@@ -52,6 +54,11 @@ impl Default for Settings {
             hide_cursor: true,
             language: crate::i18n::Language::default(),
             present_mode: PresentMode::Mailbox,
+            // 7777 is rarely on the Windows excluded port range; 8080 often
+            // is because Hyper-V / WSL / Docker reserve dynamic ranges that
+            // collide with it. Users with a free 8080 can still pick it.
+            relay_port: 7777,
+            relay_autostart: false,
         }
     }
 }

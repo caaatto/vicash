@@ -210,10 +210,25 @@ fn main() -> Result<()> {
         None
     };
 
-    if let Some(addr) = cli.serve {
-        relay::spawn(addr, shared.clone(), shared_settings.clone())
-            .context("failed to start MJPEG relay")?;
-        log::info!("serving MJPEG at http://{}/", addr);
+    // Live-toggleable relay handle. Either CLI --serve or the persisted
+    // autostart flag spins it up at launch; the F1 panel can start and stop
+    // it later without touching the rest of the process.
+    let relay_slot: Arc<Mutex<Option<Arc<relay::RelayInfo>>>> = Arc::new(Mutex::new(None));
+    let autostart_port = if let Some(addr) = cli.serve {
+        Some(addr)
+    } else if cfg.relay.autostart {
+        Some(SocketAddr::from(([0, 0, 0, 0], cfg.relay.port)))
+    } else {
+        None
+    };
+    if let Some(addr) = autostart_port {
+        match relay::spawn(addr, shared.clone(), shared_settings.clone()) {
+            Ok(info) => {
+                log::info!("MJPEG relay live at {}/", info.lan_url);
+                *relay_slot.lock() = Some(info);
+            }
+            Err(e) => log::error!("relay autostart failed: {e:#}"),
+        }
     }
 
     // Background saver: snapshots the live state into a Config every second
@@ -240,6 +255,7 @@ fn main() -> Result<()> {
             audio_runtime.clone(),
             capture_ctrl,
             metrics,
+            relay_slot,
         )?,
     }
 

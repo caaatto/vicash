@@ -2,7 +2,9 @@ use crate::audio::AudioRuntime;
 use crate::capture::{CaptureController, CaptureRequest};
 use crate::i18n::{self, Language};
 use crate::perf::PerfMetrics;
+use crate::relay::RelayInfo;
 use crate::settings::PresentMode;
+use std::sync::atomic::Ordering;
 use crate::frame::{Frame, SharedFrame, UiEvent};
 use crate::settings::{CaptureInfo, FitMode, Settings};
 use anyhow::{Context, Result, anyhow};
@@ -33,15 +35,18 @@ pub fn run(
     audio: Option<Arc<AudioRuntime>>,
     capture: Arc<CaptureController>,
     metrics: Arc<PerfMetrics>,
+    relay: Arc<Mutex<Option<Arc<RelayInfo>>>>,
 ) -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
-        shared,
+        shared: shared.clone(),
+        shared_for_relay: shared,
         settings,
         capture_info,
         audio,
         capture,
         metrics,
+        relay,
         gpu: None,
         last_seq: 0,
         last_log: Instant::now(),
@@ -50,6 +55,7 @@ pub fn run(
         tex_size: (0, 0),
         pending_capture: None,
         applied_window: AppliedWindow::default(),
+        relay_error: Arc::new(Mutex::new(None)),
     };
     event_loop.run_app(&mut app).context("event loop exited with error")?;
     Ok(())
@@ -57,11 +63,15 @@ pub fn run(
 
 struct App {
     shared: SharedFrame,
+    /// Held only so the F1 panel can re-spawn the relay if the user toggles
+    /// it. Capture publishes here, the relay reads from here.
+    shared_for_relay: SharedFrame,
     settings: Arc<Mutex<Settings>>,
     capture_info: CaptureInfo,
     audio: Option<Arc<AudioRuntime>>,
     capture: Arc<CaptureController>,
     metrics: Arc<PerfMetrics>,
+    relay: Arc<Mutex<Option<Arc<RelayInfo>>>>,
     gpu: Option<Gpu>,
     last_seq: u64,
     last_log: Instant,
@@ -73,6 +83,9 @@ struct App {
     /// Last window-mode settings applied; used to detect changes and call
     /// the right winit method only when something actually flipped.
     applied_window: AppliedWindow,
+    /// Last error from a relay start attempt, surfaced in the F1 panel so
+    /// the user does not have to dig through the log for a port collision.
+    relay_error: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -356,6 +369,7 @@ impl ApplicationHandler<UiEvent> for App {
                 if let Err(e) = render_frame(
                     gpu,
                     &mut settings,
+                    &self.settings,
                     &self.capture_info,
                     self.preview_fps,
                     self.tex_size,
@@ -363,6 +377,9 @@ impl ApplicationHandler<UiEvent> for App {
                     &self.capture,
                     &mut pending,
                     &self.metrics,
+                    &self.relay,
+                    &self.shared_for_relay,
+                    &self.relay_error,
                 ) {
                     log::warn!("render: {e:#}");
                 }
@@ -794,6 +811,7 @@ fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
 fn render_frame(
     gpu: &mut Gpu,
     settings: &mut Settings,
+    settings_arc: &Arc<Mutex<Settings>>,
     capture_info: &CaptureInfo,
     preview_fps: f32,
     tex_size: (u32, u32),
@@ -801,6 +819,9 @@ fn render_frame(
     capture: &Arc<CaptureController>,
     pending: &mut Option<PendingCapture>,
     metrics: &Arc<PerfMetrics>,
+    relay: &Arc<Mutex<Option<Arc<RelayInfo>>>>,
+    shared_for_relay: &SharedFrame,
+    relay_error: &Arc<Mutex<Option<String>>>,
 ) -> Result<()> {
     // Apply present-mode changes from the F1 panel by reconfiguring the
     // surface only when the chosen mode actually differs.
@@ -834,7 +855,7 @@ fn render_frame(
     // Build the egui UI.
     let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
     let full_output = gpu.egui_ctx.run(raw_input, |ctx| {
-        build_ui(ctx, settings, capture_info, preview_fps, audio, capture, pending, metrics);
+        build_ui(ctx, settings, settings_arc, capture_info, preview_fps, audio, capture, pending, metrics, relay, shared_for_relay, relay_error);
     });
     gpu.egui_state
         .handle_platform_output(&gpu.window, full_output.platform_output);
@@ -919,12 +940,16 @@ fn render_frame(
 fn build_ui(
     ctx: &egui::Context,
     settings: &mut Settings,
+    settings_arc: &Arc<Mutex<Settings>>,
     capture_info: &CaptureInfo,
     preview_fps: f32,
     audio: Option<&Arc<AudioRuntime>>,
     capture: &Arc<CaptureController>,
     pending: &mut Option<PendingCapture>,
     metrics: &Arc<PerfMetrics>,
+    relay: &Arc<Mutex<Option<Arc<RelayInfo>>>>,
+    shared_for_relay: &SharedFrame,
+    relay_error: &Arc<Mutex<Option<String>>>,
 ) {
     let t = i18n::strings(settings.language);
 
@@ -1046,6 +1071,95 @@ fn build_ui(
                 egui::CollapsingHeader::new(t.section_relay)
                     .default_open(false)
                     .show(ui, |ui| {
+                        let current = relay.lock().clone();
+                        match &current {
+                            Some(info) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(120, 220, 140),
+                                    t.relay_status_running,
+                                );
+                                ui.label(format!(
+                                    "{}  {}    {}  {}",
+                                    t.relay_active_clients,
+                                    info.active_clients.load(Ordering::Relaxed),
+                                    t.relay_total_clients,
+                                    info.total_clients.load(Ordering::Relaxed),
+                                ));
+                                ui.separator();
+                                ui.label(t.relay_url_lan);
+                                ui.horizontal(|ui| {
+                                    ui.monospace(format!("{}/", info.lan_url));
+                                    if ui.small_button(t.relay_copy_url).clicked() {
+                                        ui.ctx().copy_text(format!("{}/", info.lan_url));
+                                    }
+                                });
+                                ui.label(t.relay_url_local);
+                                ui.horizontal(|ui| {
+                                    ui.monospace(format!("{}/", info.local_url));
+                                    if ui.small_button(t.relay_copy_url).clicked() {
+                                        ui.ctx().copy_text(format!("{}/", info.local_url));
+                                    }
+                                });
+                                ui.separator();
+                                ui.label(t.relay_endpoints);
+                                ui.monospace(format!("  /              {}", t.relay_endpoint_browser));
+                                ui.monospace(format!("  /stream        {}", t.relay_endpoint_stream));
+                                ui.monospace(format!("  /snapshot.jpg  {}", t.relay_endpoint_snapshot));
+                                ui.separator();
+                                if ui.button(t.relay_stop).clicked() {
+                                    info.stop();
+                                    *relay.lock() = None;
+                                    settings.relay_autostart = false;
+                                }
+                            }
+                            None => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(180, 180, 180),
+                                    t.relay_status_off,
+                                );
+                                if let Some(err) = relay_error.lock().as_ref() {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(240, 130, 130),
+                                        format!("{}: {}", t.relay_error_label, err),
+                                    );
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(200, 200, 200),
+                                        t.relay_port_hint,
+                                    );
+                                }
+                            }
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(t.relay_port);
+                            ui.add(
+                                egui::DragValue::new(&mut settings.relay_port)
+                                    .range(1u16..=65535u16),
+                            );
+                            if current.is_none() && ui.button(t.relay_start).clicked() {
+                                use std::net::SocketAddr;
+                                let addr = SocketAddr::from(([0, 0, 0, 0], settings.relay_port));
+                                match crate::relay::spawn(
+                                    addr,
+                                    shared_for_relay.clone(),
+                                    settings_arc.clone(),
+                                ) {
+                                    Ok(info) => {
+                                        log::info!("relay started at {}/", info.lan_url);
+                                        *relay.lock() = Some(info);
+                                        *relay_error.lock() = None;
+                                        settings.relay_autostart = true;
+                                    }
+                                    Err(e) => {
+                                        let msg = format!("{e:#}");
+                                        log::error!("relay start failed: {msg}");
+                                        *relay_error.lock() = Some(msg);
+                                    }
+                                }
+                            }
+                        });
+                        ui.checkbox(&mut settings.relay_autostart, t.relay_autostart);
+                        ui.separator();
                         ui.add(
                             egui::Slider::new(&mut settings.jpeg_quality, 1..=100)
                                 .text(t.jpeg_quality),

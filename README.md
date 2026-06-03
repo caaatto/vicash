@@ -28,7 +28,7 @@ vicash is built for the cheap "fake USB3" capture cards (MS2109, MS2130, generic
 - Borderless fullscreen + always on top + hide cursor (F11) so the window behaves like a real second monitor
 - Audio passthrough from the capture card audio device to your default output, with a live volume slider, mute, and a sync delay slider so you can match audio to picture by ear
 - Live device switching from the F1 panel: pick audio input, audio output, capture resolution and fps without restarting
-- MJPEG over HTTP relay (`--serve 0.0.0.0:8080`) so a second PC can pull the feed in OBS as a browser source
+- MJPEG over HTTP relay (`--serve 0.0.0.0:7777`) so a second PC can pull the feed in OBS as a browser source
 - Honest performance dashboard: capture-to-present pipeline latency in milliseconds and capture-side frame interval, so you can see exactly which part of the chain is slow
 - Settings persist to `%APPDATA%\caaatto\vicash\config.toml` and reload on next launch
 - Three UI languages: Deutsch, English, 简体中文
@@ -69,10 +69,75 @@ vicash.exe --list                             # list video devices and exit
 vicash.exe --list-audio                       # list audio devices and exit
 vicash.exe --device 0                         # open device 0 in a preview window
 vicash.exe --device 0 --audio                 # also pass audio through to default output
-vicash.exe --device 0 --serve 0.0.0.0:8080    # also serve MJPEG over HTTP
+vicash.exe --device 0 --serve 0.0.0.0:7777    # also serve MJPEG over HTTP
 ```
 
-In OBS on the second PC, add a Browser source pointed at `http://<host>:8080/`.
+## Sharing the feed to a second PC (MJPEG relay)
+
+If you have a two-PC setup (game PC running vicash, streaming PC running OBS) and you do not want to buy another capture card, vicash can publish the live feed over your local network and OBS picks it up like any other browser source.
+
+### Start it from the F1 panel (recommended)
+
+1. Open vicash, press **F1**, expand the **Relay** section.
+2. Pick a **Port** (default 7777, change it if that port is taken).
+3. Click **Starten** / **Start**. The panel updates to show:
+
+   ```
+   Relay läuft / Relay running
+   active clients 0    total since start 0
+
+   LAN (other PC / phone on the same network)
+     http://192.168.1.42:7777/   [copy URL]
+   Local (browser on this PC)
+     http://127.0.0.1:7777/      [copy URL]
+
+   Endpoints
+     /              browser / OBS Browser Source
+     /stream        raw MJPEG stream
+     /snapshot.jpg  single JPEG frame
+   ```
+
+   The LAN IP is auto-detected. Tick **Beim nächsten Start automatisch starten** / **Start automatically on next launch** to have vicash bring the relay up on its own next time.
+
+4. Drag the JPEG quality slider to taste. 70-80 is a good balance of bandwidth and visual quality; drop it if your LAN is congested or you want to save CPU on the game PC.
+
+### Or pass `--serve` at launch
+
+```
+vicash.exe --device 0 --audio --serve 0.0.0.0:7777
+```
+
+`0.0.0.0:7777` listens on every network interface so any device on the LAN can connect. Use `127.0.0.1:7777` to keep the stream on this machine only.
+
+### Streaming PC (the one running OBS)
+
+1. In OBS, add a new **Browser Source**.
+2. Untick "Local file" and paste the LAN URL from the vicash panel (e.g. `http://192.168.1.42:7777/`).
+3. Set the width and height to match your capture resolution (default vicash setting is 1280x720).
+4. Tick **Shutdown source when not visible** so the relay does not run when the scene is off-screen.
+5. Done. The capture feed shows up in OBS as if it were a local source.
+
+The Relay section in the F1 panel on the game PC shows **active clients 1** once OBS connects, which is handy for confirming the link is alive.
+
+### Other consumers
+
+- Any browser on any device on the LAN: open the LAN URL and you see the feed full-screen with a tiny help overlay. Works on a phone or tablet too.
+- `ffplay http://192.168.1.42:7777/stream` if you want a separate window outside OBS.
+- `curl -o frame.jpg http://192.168.1.42:7777/snapshot.jpg` to grab a single still.
+
+### Port already in use? (Windows error 10013)
+
+Windows reserves dynamic port ranges for Hyper-V, WSL, Docker and IIS. If the **Start** button shows a red error in the panel, pick a different port. 7777 is the new default for this reason; 8181, 9090 and 5500 are also usually free. Admin rights do **not** help, the OS-level reservation overrides everyone.
+
+To see which ports are excluded on your machine:
+
+```
+netsh interface ipv4 show excludedportrange protocol=tcp
+```
+
+### Latency note
+
+MJPEG over HTTP is simple and bulletproof but not the lowest-latency wire format. Expect roughly 100-200 ms more than the local vicash preview window. For tight gameplay you still play off the local vicash window; the relay is what your viewers / co-streamers / second-PC OBS see.
 
 ## A note on the cheap-card limit
 

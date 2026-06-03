@@ -42,6 +42,8 @@ pub struct MonitorConfig {
 #[serde(default)]
 pub struct RelayConfig {
     pub jpeg_quality: u8,
+    pub port: u16,
+    pub autostart: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +112,8 @@ impl Default for Config {
             },
             relay: RelayConfig {
                 jpeg_quality: s.jpeg_quality,
+                port: s.relay_port,
+                autostart: s.relay_autostart,
             },
             capture: CaptureConfig::default(),
             audio: AudioConfig::default(),
@@ -143,7 +147,7 @@ impl Default for MonitorConfig {
 
 impl Default for RelayConfig {
     fn default() -> Self {
-        Self { jpeg_quality: 75 }
+        Self { jpeg_quality: 75, port: 7777, autostart: false }
     }
 }
 
@@ -229,6 +233,8 @@ pub fn settings_from_config(cfg: &Config) -> Settings {
         hide_cursor: cfg.monitor.hide_cursor,
         language: cfg.language,
         present_mode: cfg.display.present_mode,
+        relay_port: cfg.relay.port,
+        relay_autostart: cfg.relay.autostart,
     }
 }
 
@@ -254,6 +260,8 @@ pub fn config_from_runtime(
         },
         relay: RelayConfig {
             jpeg_quality: s.jpeg_quality,
+            port: s.relay_port,
+            autostart: s.relay_autostart,
         },
         capture: capture.clone(),
         audio: audio.clone(),
