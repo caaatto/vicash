@@ -6,6 +6,12 @@ pub struct Settings {
     pub fit_mode: FitMode,
     pub background_color: [f32; 3],
     pub jpeg_quality: u8,
+    /// Monitor-mode toggles. Together they turn the preview window into a
+    /// proper second-screen replacement for the console.
+    pub fullscreen: bool,
+    pub borderless: bool,
+    pub always_on_top: bool,
+    pub hide_cursor: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +32,10 @@ impl Default for Settings {
             fit_mode: FitMode::Fit,
             background_color: [0.0, 0.0, 0.0],
             jpeg_quality: 75,
+            fullscreen: false,
+            borderless: false,
+            always_on_top: false,
+            hide_cursor: true,
         }
     }
 }

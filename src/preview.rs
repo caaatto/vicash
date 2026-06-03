@@ -12,7 +12,7 @@ use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Icon, Window, WindowId};
+use winit::window::{Fullscreen, Icon, Window, WindowId, WindowLevel};
 
 const ICON_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icon-256.png"));
 
@@ -44,6 +44,7 @@ pub fn run(
         preview_fps: 0.0,
         tex_size: (0, 0),
         pending_capture: None,
+        applied_window: AppliedWindow::default(),
     };
     event_loop.run_app(&mut app).context("event loop exited with error")?;
     Ok(())
@@ -63,6 +64,17 @@ struct App {
     tex_size: (u32, u32),
     /// Resolution / fps the user is staging in the F1 panel before Apply.
     pending_capture: Option<PendingCapture>,
+    /// Last window-mode settings applied; used to detect changes and call
+    /// the right winit method only when something actually flipped.
+    applied_window: AppliedWindow,
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+struct AppliedWindow {
+    fullscreen: bool,
+    borderless: bool,
+    always_on_top: bool,
+    hide_cursor: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -208,6 +220,35 @@ impl ApplicationHandler<UiEvent> for App {
                 s.show_panel = !s.show_panel;
                 gpu.window.request_redraw();
             }
+            WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    state: ElementState::Pressed,
+                    physical_key: PhysicalKey::Code(KeyCode::F11),
+                    repeat: false,
+                    ..
+                },
+                ..
+            } => {
+                let mut s = self.settings.lock();
+                s.fullscreen = !s.fullscreen;
+                gpu.window.request_redraw();
+            }
+            WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    state: ElementState::Pressed,
+                    physical_key: PhysicalKey::Code(KeyCode::Escape),
+                    repeat: false,
+                    ..
+                },
+                ..
+            } => {
+                // Esc leaves fullscreen so the user always has a way out.
+                let mut s = self.settings.lock();
+                if s.fullscreen {
+                    s.fullscreen = false;
+                    gpu.window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let Some(f) = self.shared.get() {
                     if f.seq != self.last_seq {
@@ -217,6 +258,7 @@ impl ApplicationHandler<UiEvent> for App {
                     }
                 }
                 let mut settings = self.settings.lock().clone();
+                apply_window_mode(&gpu.window, &settings, &mut self.applied_window);
                 let mut pending = self.pending_capture;
                 if let Err(e) = render_frame(
                     gpu,
@@ -633,6 +675,13 @@ fn build_ui(
                     capture_info.fps_target, capture_info.format_label
                 ));
                 ui.separator();
+                ui.label("Monitor-Modus");
+                ui.checkbox(&mut settings.fullscreen, "Vollbild  (F11 / Esc)");
+                ui.checkbox(&mut settings.borderless, "Rahmenlos");
+                ui.checkbox(&mut settings.always_on_top, "Immer im Vordergrund");
+                ui.checkbox(&mut settings.hide_cursor, "Mauszeiger im Vollbild verstecken");
+
+                ui.separator();
                 ui.label("Anzeige");
                 egui::ComboBox::from_label("Bildanpassung")
                     .selected_text(match settings.fit_mode {
@@ -878,6 +927,39 @@ fn quad_scale(mode: FitMode, src_aspect: f32, dst_aspect: f32) -> (f32, f32) {
             }
         }
     }
+}
+
+fn apply_window_mode(window: &Window, settings: &Settings, applied: &mut AppliedWindow) {
+    let want = AppliedWindow {
+        fullscreen: settings.fullscreen,
+        borderless: settings.borderless,
+        always_on_top: settings.always_on_top,
+        hide_cursor: settings.hide_cursor && settings.fullscreen,
+    };
+    if want.fullscreen != applied.fullscreen {
+        window.set_fullscreen(if want.fullscreen {
+            Some(Fullscreen::Borderless(None))
+        } else {
+            None
+        });
+    }
+    if want.borderless != applied.borderless {
+        // Decorations only matter in windowed mode; in fullscreen we suppress
+        // them anyway, but tracking the user's preference keeps the toggle
+        // honest when fullscreen is turned off.
+        window.set_decorations(!want.borderless);
+    }
+    if want.always_on_top != applied.always_on_top {
+        window.set_window_level(if want.always_on_top {
+            WindowLevel::AlwaysOnTop
+        } else {
+            WindowLevel::Normal
+        });
+    }
+    if want.hide_cursor != applied.hide_cursor {
+        window.set_cursor_visible(!want.hide_cursor);
+    }
+    *applied = want;
 }
 
 fn load_icon() -> Option<Icon> {
