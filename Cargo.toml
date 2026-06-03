@@ -1,14 +1,15 @@
 [package]
-name = "video-capture-share"
+name = "vicash"
 version = "0.1.0"
 edition = "2021"
 authors = ["caaatto"]
 license = "MIT"
-description = "Low overhead capture card preview and LAN relay for streamers"
+description = "vicash: low overhead capture card preview and LAN relay for streamers"
 repository = "https://github.com/caaatto/video-capture-share"
+build = "build.rs"
 
 [[bin]]
-name = "video-capture-share"
+name = "vicash"
 path = "src/main.rs"
 
 [dependencies]
@@ -27,7 +28,7 @@ wgpu = "23"
 winit = "0.30"
 tiny_http = "0.12"
 turbojpeg = { version = "1", optional = true }
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 parking_lot = "0.12"
 log = "0.4"
 env_logger = "0.11"
@@ -35,6 +36,12 @@ env_logger = "0.11"
 [features]
 default = []
 fast-jpeg = ["turbojpeg"]
+
+[build-dependencies]
+tiny-skia = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+ico = "0.4"
+ab_glyph = "0.2"
 
 [profile.release]
 lto = "thin"

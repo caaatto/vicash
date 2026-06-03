@@ -11,7 +11,9 @@ use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Icon, Window, WindowId};
+
+const ICON_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icon-256.png"));
 
 pub fn build_event_loop() -> Result<EventLoop<UiEvent>> {
     EventLoop::<UiEvent>::with_user_event()
@@ -111,9 +113,18 @@ impl ApplicationHandler<UiEvent> for App {
         if self.gpu.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title("video capture share")
+        let icon = load_icon();
+        let mut attrs = Window::default_attributes()
+            .with_title("vicash")
             .with_inner_size(PhysicalSize::new(1280u32, 720u32));
+        if let Some(i) = icon.clone() {
+            attrs = attrs.with_window_icon(Some(i));
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(i) = icon {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_taskbar_icon(Some(i));
+        }
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -122,6 +133,12 @@ impl ApplicationHandler<UiEvent> for App {
                 return;
             }
         };
+        // Apply the icon to the live window too. Windows in particular
+        // sometimes ignores the attribute and only honours set_window_icon
+        // called after the HWND exists.
+        if let Some(i) = load_icon() {
+            window.set_window_icon(Some(i));
+        }
         match pollster::block_on(init_gpu(window.clone())) {
             Ok(gpu) => {
                 gpu.window.request_redraw();
@@ -567,68 +584,72 @@ fn build_ui(
                         ui.colored_label(
                             egui::Color32::WHITE,
                             format!(
-                                "target {} fps  {}",
+                                "Ziel {} fps  {}",
                                 capture_info.fps_target, capture_info.format_label
                             ),
                         );
                         ui.colored_label(
                             egui::Color32::WHITE,
-                            format!("preview {:.1} fps", preview_fps),
+                            format!("Vorschau {:.1} fps", preview_fps),
                         );
                         ui.colored_label(
                             egui::Color32::from_rgb(200, 200, 200),
-                            "F1 for settings",
+                            "F1 für Einstellungen",
                         );
                     });
             });
     }
 
     if settings.show_panel {
-        egui::Window::new("settings")
+        egui::Window::new("Einstellungen")
             .default_pos(egui::pos2(20.0, 80.0))
             .resizable(false)
             .collapsible(true)
             .show(ctx, |ui| {
                 ui.label(format!(
-                    "target: {} fps  {}",
+                    "Ziel: {} fps  {}",
                     capture_info.fps_target, capture_info.format_label
                 ));
                 ui.separator();
-                ui.label("display");
-                egui::ComboBox::from_label("fit")
-                    .selected_text(format!("{:?}", settings.fit_mode))
+                ui.label("Anzeige");
+                egui::ComboBox::from_label("Bildanpassung")
+                    .selected_text(match settings.fit_mode {
+                        FitMode::Stretch => "Strecken",
+                        FitMode::Fit => "Einpassen (Letterbox)",
+                        FitMode::Fill => "Füllen (zuschneiden)",
+                    })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut settings.fit_mode, FitMode::Stretch, "stretch");
-                        ui.selectable_value(&mut settings.fit_mode, FitMode::Fit, "fit (letterbox)");
-                        ui.selectable_value(&mut settings.fit_mode, FitMode::Fill, "fill (crop)");
+                        ui.selectable_value(&mut settings.fit_mode, FitMode::Stretch, "Strecken");
+                        ui.selectable_value(&mut settings.fit_mode, FitMode::Fit, "Einpassen (Letterbox)");
+                        ui.selectable_value(&mut settings.fit_mode, FitMode::Fill, "Füllen (zuschneiden)");
                     });
-                ui.checkbox(&mut settings.show_stats, "show stats overlay");
+                ui.checkbox(&mut settings.show_stats, "Statistik-Overlay zeigen");
                 ui.horizontal(|ui| {
-                    ui.label("background");
+                    ui.label("Hintergrund");
                     ui.color_edit_button_rgb(&mut settings.background_color);
                 });
                 ui.separator();
-                ui.label("relay");
+                ui.label("Relay");
                 ui.add(
                     egui::Slider::new(&mut settings.jpeg_quality, 1..=100)
-                        .text("JPEG quality"),
+                        .text("JPEG-Qualität"),
                 );
 
                 if let Some(rt) = audio {
                     ui.separator();
-                    ui.label("audio");
+                    ui.label("Audio");
                     let state = &rt.state;
                     let in_name = state.input_name();
                     let out_name = state.output_name();
                     ui.label(format!(
-                        "{} Hz, {} ch, buffered {} ms",
+                        "{} Hz, {} Kanäle, gepuffert {} ms",
                         state.sample_rate(),
                         state.channels(),
                         state.buffered_ms()
                     ));
 
                     ui.horizontal(|ui| {
-                        ui.label("in ");
+                        ui.label("Eingang ");
                         let mut chosen = in_name.clone();
                         egui::ComboBox::from_id_salt("audio_in")
                             .selected_text(short(&chosen))
@@ -644,7 +665,7 @@ fn build_ui(
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.label("out");
+                        ui.label("Ausgang");
                         let mut chosen = out_name.clone();
                         egui::ComboBox::from_id_salt("audio_out")
                             .selected_text(short(&chosen))
@@ -664,7 +685,7 @@ fn build_ui(
                     if ui
                         .add(
                             egui::Slider::new(&mut volume, 0..=200)
-                                .text("volume (%)")
+                                .text("Lautstärke (%)")
                                 .integer(),
                         )
                         .changed()
@@ -672,14 +693,14 @@ fn build_ui(
                         state.set_volume(volume);
                     }
                     let mut muted = state.is_muted();
-                    if ui.checkbox(&mut muted, "mute").changed() {
+                    if ui.checkbox(&mut muted, "Stumm").changed() {
                         state.set_muted(muted);
                     }
                     let mut delay = state.delay_ms();
                     if ui
                         .add(
                             egui::Slider::new(&mut delay, 0..=500)
-                                .text("sync delay (ms)")
+                                .text("Sync-Verzögerung (ms)")
                                 .integer(),
                         )
                         .changed()
@@ -690,16 +711,16 @@ fn build_ui(
                     ui.separator();
                     ui.colored_label(
                         egui::Color32::from_rgb(180, 180, 180),
-                        "audio off (pass --audio on launch to enable)",
+                        "Audio aus (beim Start --audio mitgeben)",
                     );
                 }
 
                 ui.separator();
                 ui.colored_label(
                     egui::Color32::from_rgb(180, 180, 180),
-                    "device, resolution and fps apply on next launch",
+                    "Gerät, Auflösung und fps gelten ab dem nächsten Start",
                 );
-                if ui.button("close").clicked() {
+                if ui.button("Schließen").clicked() {
                     settings.show_panel = false;
                 }
             });
@@ -724,6 +745,29 @@ fn quad_scale(mode: FitMode, src_aspect: f32, dst_aspect: f32) -> (f32, f32) {
             } else {
                 (1.0, dst_aspect / src_aspect)
             }
+        }
+    }
+}
+
+fn load_icon() -> Option<Icon> {
+    log::info!("loading icon, png size = {} bytes", ICON_PNG.len());
+    let img = match image::load_from_memory(ICON_PNG) {
+        Ok(i) => i.to_rgba8(),
+        Err(e) => {
+            log::error!("icon png decode failed: {e}");
+            return None;
+        }
+    };
+    let (w, h) = img.dimensions();
+    log::info!("icon decoded {}x{}, building winit icon", w, h);
+    match Icon::from_rgba(img.into_raw(), w, h) {
+        Ok(i) => {
+            log::info!("icon ready");
+            Some(i)
+        }
+        Err(e) => {
+            log::error!("icon from_rgba failed: {e}");
+            None
         }
     }
 }

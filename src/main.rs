@@ -13,9 +13,9 @@ mod settings;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "video-capture-share",
+    name = "vicash",
     version,
-    about = "Low overhead capture card preview and LAN relay",
+    about = "vicash: low overhead capture card preview and LAN relay",
     long_about = None,
 )]
 struct Cli {
