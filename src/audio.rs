@@ -41,6 +41,16 @@ pub struct AudioState {
     /// averages all input channels into one signal then broadcasts that to
     /// every output channel, so the audio shows up on both speakers.
     pub mix_to_mono: AtomicBool,
+    /// Optional second sink that the input callback also writes to. Used by
+    /// the fMP4 relay to consume raw f32 samples in parallel with the local
+    /// speaker output, without rebuilding the audio stream. The relay
+    /// install/remove this producer when its lifecycle starts/stops.
+    pub relay_sink: Mutex<Option<HeapProd<f32>>>,
+    /// Fast-path gate read by the input callback. When false the callback
+    /// must NOT touch `relay_sink` at all - locking even an uncontended
+    /// Mutex inside a real-time audio callback can push WASAPI past its
+    /// frame deadline and force the local speaker output to drift.
+    pub relay_active: AtomicBool,
 }
 
 pub fn list_input_devices() -> Vec<String> {
@@ -77,6 +87,8 @@ pub fn start(input_hint: Option<&str>, delay_ms: u32) -> Result<AudioRuntime> {
         volume_percent: AtomicU32::new(100),
         muted: AtomicBool::new(false),
         mix_to_mono: AtomicBool::new(false),
+        relay_sink: Mutex::new(None),
+        relay_active: AtomicBool::new(false),
     });
 
     let streams = build_streams(&input, &output, &state)?;
@@ -171,6 +183,32 @@ impl AudioState {
 
     pub fn set_mix_to_mono(&self, m: bool) {
         self.mix_to_mono.store(m, Ordering::Relaxed);
+    }
+
+    /// Attach a relay-side producer that the input callback will also push
+    /// each captured sample into. Returns a fresh consumer the caller can
+    /// drain on its own thread. The producer is dropped automatically when
+    /// the caller releases its consumer (consumer drop disconnects).
+    pub fn install_relay_sink(&self, capacity: usize) -> HeapCons<f32> {
+        let rb = HeapRb::<f32>::new(capacity);
+        let (prod, cons) = rb.split();
+        *self.relay_sink.lock() = Some(prod);
+        // Order matters: install the producer first, THEN flip the gate
+        // so the callback sees a consistent state (gate true => sink
+        // already populated).
+        self.relay_active.store(true, Ordering::Release);
+        cons
+    }
+
+    /// Detach the relay sink so the input callback stops fanning out. Any
+    /// samples already buffered in the consumer half stay there until that
+    /// consumer is itself dropped.
+    pub fn remove_relay_sink(&self) {
+        // Flip the gate off first so subsequent callbacks skip the path,
+        // THEN tear the producer down. This guarantees no callback is
+        // mid-push when the producer disappears.
+        self.relay_active.store(false, Ordering::Release);
+        *self.relay_sink.lock() = None;
     }
 
     fn delay_samples(&self) -> usize {
@@ -277,11 +315,29 @@ fn build_input(
     let prod_for_cb = prod.clone();
     let state_for_cb = state.clone();
     let push = move |samples: &[f32]| {
-        let mut p = prod_for_cb.lock();
-        for s in samples {
-            let _ = p.try_push(*s);
+        // Push to the local-speaker ringbuf; release the lock as soon as
+        // we are done so we do NOT hold it while taking the relay lock.
+        // Holding two locks across the second push tripled the worst-case
+        // callback time and made WASAPI drift.
+        {
+            let mut p = prod_for_cb.lock();
+            for s in samples {
+                let _ = p.try_push(*s);
+            }
+            state_for_cb.buffered_samples.store(p.occupied_len(), Ordering::Relaxed);
         }
-        state_for_cb.buffered_samples.store(p.occupied_len(), Ordering::Relaxed);
+        // Fast-path gate: the lock and per-sample push for the relay
+        // sink only run when the fMP4 relay is actually active. When the
+        // toggle is off, this is one atomic load + a branch and the
+        // input callback finishes within its real-time deadline.
+        if state_for_cb.relay_active.load(Ordering::Relaxed) {
+            let mut relay = state_for_cb.relay_sink.lock();
+            if let Some(rp) = relay.as_mut() {
+                for s in samples {
+                    let _ = rp.try_push(*s);
+                }
+            }
+        }
     };
 
     let stream = match fmt {

@@ -38,6 +38,7 @@ pub fn run(
     capture: Arc<CaptureController>,
     metrics: Arc<PerfMetrics>,
     relay: Arc<Mutex<Option<Arc<RelayInfo>>>>,
+    updater: Arc<crate::updater::UpdaterState>,
 ) -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
@@ -62,6 +63,7 @@ pub fn run(
         ctrl_held: false,
         last_new_frame_at: None,
         last_bright_frame_at: None,
+        updater,
     };
     event_loop.run_app(&mut app).context("event loop exited with error")?;
     Ok(())
@@ -104,6 +106,9 @@ struct App {
     /// frames when the console is asleep; tracking the last bright frame
     /// is what actually catches a sleeping console.
     last_bright_frame_at: Option<Instant>,
+    /// Background self-updater. Holds the result of the startup check so
+    /// the F1 panel can surface "update available" + an apply button.
+    updater: Arc<crate::updater::UpdaterState>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -565,6 +570,7 @@ impl ApplicationHandler<UiEvent> for App {
                     last_captured,
                     self.last_new_frame_at,
                     self.last_bright_frame_at,
+                    &self.updater,
                 ) {
                     log::warn!("render: {e:#}");
                 }
@@ -1145,6 +1151,7 @@ fn render_frame(
     last_captured: Option<std::time::Instant>,
     last_new_frame_at: Option<Instant>,
     last_bright_frame_at: Option<Instant>,
+    updater: &Arc<crate::updater::UpdaterState>,
 ) -> Result<()> {
     // Apply present-mode changes from the F1 panel by reconfiguring the
     // surface only when the chosen mode actually differs.
@@ -1208,7 +1215,7 @@ fn render_frame(
     // Build the egui UI.
     let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
     let full_output = gpu.egui_ctx.run(raw_input, |ctx| {
-        build_ui(ctx, settings, settings_arc, capture_info, preview_fps, audio, capture, pending, metrics, relay, shared_for_relay, relay_error);
+        build_ui(ctx, settings, settings_arc, capture_info, preview_fps, audio, capture, pending, metrics, relay, shared_for_relay, relay_error, updater);
         if no_signal {
             egui::Area::new(egui::Id::new("no_signal_overlay"))
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -1341,6 +1348,7 @@ fn build_ui(
     relay: &Arc<Mutex<Option<Arc<RelayInfo>>>>,
     shared_for_relay: &SharedFrame,
     relay_error: &Arc<Mutex<Option<String>>>,
+    updater: &Arc<crate::updater::UpdaterState>,
 ) {
     let t = i18n::strings(settings.language);
 
@@ -1653,6 +1661,62 @@ fn build_ui(
                                 );
                             }
                         }
+
+                        // fMP4 audio+video relay (needs ffmpeg.exe). Spawn /
+                        // drop the subprocess as the toggle flips. Only
+                        // available while the base relay is running.
+                        if let Some(info) = current.as_ref() {
+                            ui.separator();
+                            ui.label(egui::RichText::new(t.fmp4_section).strong());
+                            let mut have_fmp4 = info.fmp4.lock().is_some();
+                            let want_fmp4 = ui
+                                .checkbox(&mut have_fmp4, t.fmp4_toggle)
+                                .changed()
+                                .then_some(have_fmp4);
+                            if let Some(want) = want_fmp4 {
+                                if want {
+                                    let cap = capture.state.current.lock().clone();
+                                    match (cap, audio) {
+                                        (Some(c), Some(a)) => {
+                                            let w = c.resolution().width();
+                                            let h = c.resolution().height();
+                                            let fps = c.frame_rate();
+                                            match crate::fmp4_relay::Fmp4Relay::spawn(
+                                                shared_for_relay.clone(),
+                                                a.state.clone(),
+                                                w,
+                                                h,
+                                                fps,
+                                            ) {
+                                                Ok(r) => {
+                                                    *info.fmp4.lock() = Some(Arc::new(r));
+                                                }
+                                                Err(e) => {
+                                                    log::error!("fMP4 relay start failed: {e:#}");
+                                                    *relay_error.lock() = Some(format!("{e:#}"));
+                                                }
+                                            }
+                                        }
+                                        (None, _) => log::warn!("fMP4 relay needs an active capture"),
+                                        (_, None) => log::warn!("fMP4 relay needs --audio enabled"),
+                                    }
+                                } else if let Some(old) = info.fmp4.lock().take() {
+                                    old.shutdown();
+                                }
+                            }
+                            if info.fmp4.lock().is_some() {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(120, 220, 140),
+                                    t.fmp4_status_running,
+                                );
+                                ui.label(format!("{}/player", info.lan_url));
+                                ui.label(format!("{}/player", info.local_url));
+                                ui.small(t.fmp4_hint);
+                            } else {
+                                ui.small(t.fmp4_hint);
+                            }
+                        }
+
                         ui.separator();
                         ui.add(
                             egui::Slider::new(&mut settings.jpeg_quality, 1..=100)
@@ -1686,6 +1750,54 @@ fn build_ui(
                         ui.label(format!("{} {:.1} fps", t.perf_preview, fps));
                         ui.label(format!("{} {:.1} ms", t.perf_pipeline_latency, pipe_ms));
                         ui.label(format!("{} {:.1} ms", t.perf_capture_interval, cap_ms));
+                    });
+
+                egui::CollapsingHeader::new(t.section_update)
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(format!(
+                            "{} {}",
+                            t.update_current_version,
+                            crate::updater::CURRENT_VERSION
+                        ));
+                        let status = updater.last_check_result.lock().clone();
+                        match status {
+                            crate::updater::UpdateCheck::Idle => {
+                                ui.label(t.update_idle);
+                            }
+                            crate::updater::UpdateCheck::Checking => {
+                                ui.spinner();
+                                ui.label(t.update_checking);
+                            }
+                            crate::updater::UpdateCheck::UpToDate => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(120, 220, 140),
+                                    t.update_up_to_date,
+                                );
+                            }
+                            crate::updater::UpdateCheck::Available(info) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 180, 90),
+                                    format!("{} {}", t.update_available, info.latest_version),
+                                );
+                                if ui.button(t.update_install).clicked() {
+                                    updater.clone().spawn_apply(info);
+                                }
+                            }
+                            crate::updater::UpdateCheck::Applying => {
+                                ui.spinner();
+                                ui.label(t.update_applying);
+                            }
+                            crate::updater::UpdateCheck::Failed(msg) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 110, 110),
+                                    format!("{}: {}", t.update_failed, msg),
+                                );
+                            }
+                        }
+                        if ui.button(t.update_check_now).clicked() {
+                            updater.clone().spawn_background_check();
+                        }
                     });
 
                 ui.separator();

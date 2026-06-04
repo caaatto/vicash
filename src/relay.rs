@@ -1,3 +1,4 @@
+use crate::fmp4_relay::Fmp4Relay;
 use crate::frame::{FrameData, SharedFrame};
 use crate::settings::Settings;
 #[cfg(windows)]
@@ -32,6 +33,11 @@ pub struct RelayInfo {
     /// platforms without an MSMF encoder (anything but Windows for now).
     #[cfg(windows)]
     pub ts: Arc<TsBroadcaster>,
+    /// Optional fragmented-MP4 + AAC relay backed by an ffmpeg subprocess.
+    /// Set when the user enables "Audio im Relay" in F1; cleared on
+    /// toggle-off. Behind a Mutex so the HTTP /stream.mp4 handler can
+    /// read it at request time.
+    pub fmp4: Mutex<Option<Arc<Fmp4Relay>>>,
 }
 
 impl RelayInfo {
@@ -117,6 +123,7 @@ pub fn spawn(
         shutdown: shutdown.clone(),
         #[cfg(windows)]
         ts: ts.clone(),
+        fmp4: Mutex::new(None),
     });
     let jpeg = Arc::new(SharedJpeg::new());
 
@@ -254,6 +261,8 @@ fn handle(
         "/snapshot.jpg" => serve_snapshot(request, jpeg),
         #[cfg(windows)]
         "/stream.ts" => serve_mpegts(request, info),
+        "/stream.mp4" => serve_fmp4(request, info),
+        "/player" | "/player.html" => serve_fmp4_player(request),
         _ => {
             let _ = request.respond(Response::from_string("not found").with_status_code(404));
             Ok(())
@@ -288,6 +297,126 @@ fn serve_mpegts(request: tiny_http::Request, info: Arc<RelayInfo>) -> Result<()>
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    Ok(())
+}
+
+/// Stream the fragmented-MP4 produced by the ffmpeg subprocess. Sends the
+/// cached init segment first so the browser's MSE buffer can warm up, then
+/// loops on the broadcaster's condvar pushing each fresh media segment to
+/// the client. Returns when the client disconnects or the relay shuts down.
+fn serve_fmp4(request: tiny_http::Request, info: Arc<RelayInfo>) -> Result<()> {
+    use std::io::Write as IoWrite;
+    // Snapshot the Arc into a local so we keep the relay alive for the
+    // duration of this response even if the user toggles it off mid-stream.
+    let relay = info.fmp4.lock().clone();
+    let Some(relay) = relay else {
+        let _ = request.respond(
+            Response::from_string("fMP4 relay not enabled (toggle 'Audio im Relay' in F1, needs ffmpeg.exe)")
+                .with_status_code(503),
+        );
+        return Ok(());
+    };
+
+    // The init segment may not be ready yet if the encoder just started.
+    // Briefly wait for it; if it never arrives, return a clean error so
+    // browsers do not see truncated MP4 bytes.
+    let mut init = relay.state.init_segment();
+    let init_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while init.is_none() && std::time::Instant::now() < init_deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        if relay.state.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        init = relay.state.init_segment();
+    }
+    let Some(init) = init else {
+        let _ = request.respond(
+            Response::from_string("fMP4 init segment not ready - is ffmpeg still warming up?")
+                .with_status_code(503),
+        );
+        return Ok(());
+    };
+
+    let mut writer = request.into_writer();
+    write!(writer, "HTTP/1.1 200 OK\r\n")?;
+    write!(writer, "Content-Type: video/mp4\r\n")?;
+    write!(writer, "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n")?;
+    write!(writer, "Pragma: no-cache\r\n")?;
+    write!(writer, "Connection: close\r\n")?;
+    write!(writer, "\r\n")?;
+    writer.write_all(&init)?;
+    writer.flush()?;
+
+    info.active_clients.fetch_add(1, Ordering::Relaxed);
+    info.total_clients.fetch_add(1, Ordering::Relaxed);
+    let _guard = ClientGuard(info.clone());
+
+    let mut last_seen: u64 = 0;
+    while !info.shutdown.load(Ordering::Relaxed)
+        && !relay.state.shutdown.load(Ordering::Relaxed)
+    {
+        match relay.state.wait_for_next(last_seen, Duration::from_millis(500)) {
+            Some((segment, seq)) => {
+                last_seen = seq;
+                writer.write_all(&segment)?;
+                writer.flush()?;
+            }
+            None => continue,
+        }
+    }
+    Ok(())
+}
+
+/// Serve a tiny HTML page that pulls /stream.mp4 through Media Source
+/// Extensions and aggressively trims its own buffer so latency stays near
+/// the fragment duration (~0.5-1s) instead of the multi-second default a
+/// raw `<video src="/stream.mp4">` would buffer. Use this URL in OBS
+/// Browser Source for the lowest practical end-to-end delay.
+fn serve_fmp4_player(request: tiny_http::Request) -> Result<()> {
+    let html = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>vicash fMP4</title>
+<style>
+  html,body{margin:0;background:#000;height:100%}
+  video{display:block;width:100%;height:100%;object-fit:contain;background:#000}
+</style></head>
+<body>
+<video id="v" autoplay muted playsinline></video>
+<script>
+const v = document.getElementById('v');
+const ms = new MediaSource();
+v.src = URL.createObjectURL(ms);
+ms.addEventListener('sourceopen', async () => {
+  const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E,mp4a.40.2"');
+  sb.mode = 'sequence';
+  const res = await fetch('/stream.mp4');
+  const reader = res.body.getReader();
+  const wait = () => new Promise(r => sb.updating ? sb.addEventListener('updateend', r, {once:true}) : r());
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    await wait();
+    sb.appendBuffer(value);
+    if (sb.buffered.length) {
+      const start = sb.buffered.start(0);
+      const end = sb.buffered.end(0);
+      if (end - start > 3) {
+        await wait();
+        sb.remove(start, end - 1);
+      }
+    }
+  }
+});
+setInterval(() => {
+  if (v.buffered.length) {
+    const live = v.buffered.end(v.buffered.length - 1);
+    if (live - v.currentTime > 1.2) v.currentTime = live - 0.3;
+  }
+}, 400);
+v.play().catch(() => {});
+</script>
+</body></html>"#;
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
+    request.respond(Response::from_string(html).with_header(header))?;
     Ok(())
 }
 

@@ -35,6 +35,8 @@ vicash is built for the cheap "fake USB3" capture cards (MS2109, MS2130, generic
 - MJPEG over HTTP relay (`--serve 0.0.0.0:7777`) so a second PC can pull the feed in OBS as a browser source, with a **localhost-only bind toggle** for privacy on public networks
 - "No signal" overlay when frame delivery stops, so you can tell at a glance whether the cable, console or app went away
 - Honest performance dashboard: capture-to-present pipeline latency in milliseconds and capture-side frame interval, so you can see exactly which part of the chain is slow
+- **Self-updater** that checks GitHub Releases on startup and offers a one-click install + restart for new versions, so critical fixes (like the v0.1.4 DWM crash hotfix) reach you without you having to think about it
+- **Audio + video relay over fMP4 (beta)** with optional `ffmpeg.exe`. Open `/player` for a low-latency MSE viewer (~0.5-1s) or `/stream.mp4` directly for OBS Browser Source. Marked beta because audio capture-card sync varies by hardware
 - Settings persist to `%APPDATA%\caaatto\vicash\config.toml` and reload on next launch
 - Three UI languages: Deutsch, English, 简体中文
 

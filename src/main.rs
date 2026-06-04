@@ -7,6 +7,7 @@ use std::sync::Arc;
 mod audio;
 mod capture;
 mod config;
+mod fmp4_relay;
 mod frame;
 #[cfg(windows)]
 mod h264_encoder;
@@ -18,6 +19,7 @@ mod record;
 mod relay;
 mod settings;
 mod threadprio;
+mod updater;
 #[cfg(windows)]
 mod video_stream;
 
@@ -98,6 +100,10 @@ fn main() -> Result<()> {
     // Main thread runs the render / event loop, so raise its priority before
     // anything else schedules.
     threadprio::bump_render_thread();
+
+    // Delete any vicash.exe.old left behind by the previous self-update.
+    // Safe no-op on first run.
+    updater::cleanup_previous();
 
     let cli = Cli::parse();
 
@@ -285,6 +291,10 @@ fn main() -> Result<()> {
         initial_presets,
     );
 
+    // Background update check. Surfaced in the F1 panel; never blocks UI.
+    let updater_state = updater::UpdaterState::new();
+    updater_state.clone().spawn_background_check();
+
     match event_loop {
         None => {
             log::info!("headless mode, no preview window. Press Ctrl C to exit.");
@@ -301,6 +311,7 @@ fn main() -> Result<()> {
             capture_ctrl,
             metrics,
             relay_slot,
+            updater_state,
         )?,
     }
 
