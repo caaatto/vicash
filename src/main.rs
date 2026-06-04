@@ -112,7 +112,14 @@ fn main() -> Result<()> {
         AttachConsole(ATTACH_PARENT_PROCESS);
     }
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Persist panics to disk before the process dies. The GUI subsystem
+    // gives us no console to print to, so without this a panic just
+    // surfaces as a generic "vicash.exe stopped working" with no clue why.
+    install_panic_log();
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Pipe(Box::new(LogTee::new())))
+        .init();
 
     // Main thread runs the render / event loop, so raise its priority before
     // anything else schedules.
@@ -336,6 +343,90 @@ fn main() -> Result<()> {
     drop(audio_runtime);
 
     Ok(())
+}
+
+/// Return the directory where vicash keeps its diagnostic files (panic
+/// dumps, log tail). Same hierarchy as the config file, lazily created.
+fn diagnostics_dir() -> Option<std::path::PathBuf> {
+    let dirs = directories::ProjectDirs::from("com", "caaatto", "vicash")?;
+    let dir = dirs.config_dir().to_path_buf();
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
+/// Write every panic to `panic.log` next to the config file. The previous
+/// release shipped without a console, so any panic surfaced as a generic
+/// "stopped working" dialog with no information. This hook keeps the
+/// default panic message format and appends a fresh entry per panic so
+/// users can attach the file to a bug report.
+fn install_panic_log() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(dir) = diagnostics_dir() {
+            let path = dir.join("panic.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "==== panic at {:?} ====", std::time::SystemTime::now());
+                let _ = writeln!(f, "vicash {}", env!("CARGO_PKG_VERSION"));
+                let _ = writeln!(f, "{info}");
+                let bt = std::backtrace::Backtrace::force_capture();
+                let _ = writeln!(f, "backtrace:\n{bt}\n");
+            }
+        }
+        default_hook(info);
+    }));
+}
+
+/// env_logger sink that fans every record into both stderr (for terminal
+/// launches via AttachConsole) and a rolling file at `log.txt` in the
+/// diagnostics directory. Keeps the most recent ~512 KB so the file does
+/// not grow unbounded.
+struct LogTee {
+    file: parking_lot::Mutex<Option<std::fs::File>>,
+}
+
+impl LogTee {
+    fn new() -> Self {
+        let file = diagnostics_dir().and_then(|dir| {
+            let path = dir.join("log.txt");
+            // Truncate if it grew past ~512 KB so the disk does not fill.
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.len() > 512 * 1024 {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok()
+        });
+        LogTee {
+            file: parking_lot::Mutex::new(file),
+        }
+    }
+}
+
+impl std::io::Write for LogTee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Best effort to stderr - works only when AttachConsole succeeded.
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), buf);
+        if let Some(f) = self.file.lock().as_mut() {
+            let _ = f.write_all(buf);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::stderr().flush();
+        if let Some(f) = self.file.lock().as_mut() {
+            let _ = f.flush();
+        }
+        Ok(())
+    }
 }
 
 /// Look up the current MediaFoundation index of a device by its display
