@@ -109,6 +109,11 @@ pub fn probe(device_index: u32) -> Result<()> {
 pub struct CaptureState {
     pub available: Mutex<Vec<CameraFormat>>,
     pub current: Mutex<Option<CameraFormat>>,
+    /// Human-readable name of the device that was actually opened. Set by
+    /// the capture thread after a successful `Camera::new`, NOT by main's
+    /// pre-flight enumeration. The config saver reads from here so the
+    /// persisted name always matches the device that is really streaming.
+    pub current_device_name: Mutex<Option<String>>,
 }
 
 impl CaptureState {
@@ -116,6 +121,7 @@ impl CaptureState {
         Self {
             available: Mutex::new(Vec::new()),
             current: Mutex::new(None),
+            current_device_name: Mutex::new(None),
         }
     }
 }
@@ -199,6 +205,17 @@ fn run_once(
     let index = CameraIndex::Index(req.device_index);
     let mut cam = Camera::new(index, placeholder)
         .with_context(|| format!("failed to open device {}", req.device_index))?;
+
+    // Stamp the actually-opened device name into state so the config saver
+    // never persists a stale or wrong name even if a CLI override pointed
+    // us at a different device than the persisted one.
+    let opened_name = cam.info().human_name();
+    log::info!(
+        "capture opened device [{}] {}",
+        req.device_index,
+        opened_name
+    );
+    *state.current_device_name.lock() = Some(opened_name);
 
     let formats = cam
         .compatible_camera_formats()

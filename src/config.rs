@@ -27,6 +27,30 @@ pub struct DisplayConfig {
     pub show_stats: bool,
     pub background_color: [f32; 3],
     pub present_mode: PresentMode,
+    pub color_brightness: f32,
+    pub color_contrast: f32,
+    pub color_saturation: f32,
+    pub color_hue_deg: f32,
+    pub crt_strength: f32,
+    pub custom_aspect_w: u32,
+    pub custom_aspect_h: u32,
+    pub use_custom_aspect: bool,
+    pub zoom: f32,
+    pub pan_x: f32,
+    pub pan_y: f32,
+    /// Named colour presets. Each preset stores brightness/contrast/saturation/hue.
+    /// Keys are user-chosen labels such as "Switch", "PS2 (warmer)", "PS1 CRT".
+    #[serde(default)]
+    pub color_presets: Vec<ColorPreset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ColorPreset {
+    pub name: String,
+    pub brightness: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub hue_deg: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,11 +68,16 @@ pub struct RelayConfig {
     pub jpeg_quality: u8,
     pub port: u16,
     pub autostart: bool,
+    pub localhost_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CaptureConfig {
+    /// The device's human-readable name. Preferred over `device_index` on
+    /// reload because Windows can shuffle device indices after a reboot
+    /// or driver update.
+    pub device_name: Option<String>,
     pub device_index: Option<u32>,
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -64,6 +93,7 @@ pub struct AudioConfig {
     pub volume_percent: u32,
     pub muted: bool,
     pub delay_ms: u32,
+    pub mix_to_mono: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,12 +128,7 @@ impl Default for Config {
         let s = Settings::default();
         Self {
             language: s.language,
-            display: DisplayConfig {
-                fit_mode: s.fit_mode.into(),
-                show_stats: s.show_stats,
-                background_color: s.background_color,
-                present_mode: s.present_mode,
-            },
+            display: DisplayConfig::default(),
             monitor: MonitorConfig {
                 fullscreen: s.fullscreen,
                 borderless: s.borderless,
@@ -114,6 +139,7 @@ impl Default for Config {
                 jpeg_quality: s.jpeg_quality,
                 port: s.relay_port,
                 autostart: s.relay_autostart,
+                localhost_only: s.relay_localhost_only,
             },
             capture: CaptureConfig::default(),
             audio: AudioConfig::default(),
@@ -129,8 +155,31 @@ impl Default for DisplayConfig {
             show_stats: s.show_stats,
             background_color: s.background_color,
             present_mode: s.present_mode,
+            color_brightness: s.color_brightness,
+            color_contrast: s.color_contrast,
+            color_saturation: s.color_saturation,
+            color_hue_deg: s.color_hue_deg,
+            crt_strength: s.crt_strength,
+            custom_aspect_w: 4,
+            custom_aspect_h: 3,
+            use_custom_aspect: false,
+            zoom: s.zoom,
+            pan_x: s.pan_x,
+            pan_y: s.pan_y,
+            color_presets: builtin_color_presets(),
         }
     }
+}
+
+/// Ship a couple of named presets out of the box so the dropdown is not
+/// empty on first run. Users can rename, delete and add their own.
+fn builtin_color_presets() -> Vec<ColorPreset> {
+    vec![
+        ColorPreset { name: "Neutral".into(), brightness: 0.0, contrast: 1.0, saturation: 1.0, hue_deg: 0.0 },
+        ColorPreset { name: "Switch (punchier)".into(), brightness: 0.02, contrast: 1.08, saturation: 1.15, hue_deg: 0.0 },
+        ColorPreset { name: "Retro warm".into(), brightness: 0.0, contrast: 1.05, saturation: 0.95, hue_deg: 8.0 },
+        ColorPreset { name: "Cool".into(), brightness: 0.0, contrast: 1.0, saturation: 1.0, hue_deg: -8.0 },
+    ]
 }
 
 impl Default for MonitorConfig {
@@ -147,13 +196,14 @@ impl Default for MonitorConfig {
 
 impl Default for RelayConfig {
     fn default() -> Self {
-        Self { jpeg_quality: 75, port: 7777, autostart: false }
+        Self { jpeg_quality: 75, port: 7777, autostart: false, localhost_only: false }
     }
 }
 
 impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
+            device_name: None,
             device_index: None,
             width: None,
             height: None,
@@ -171,6 +221,7 @@ impl Default for AudioConfig {
             volume_percent: 100,
             muted: false,
             delay_ms: 100,
+            mix_to_mono: false,
         }
     }
 }
@@ -235,15 +286,37 @@ pub fn settings_from_config(cfg: &Config) -> Settings {
         present_mode: cfg.display.present_mode,
         relay_port: cfg.relay.port,
         relay_autostart: cfg.relay.autostart,
+        relay_localhost_only: cfg.relay.localhost_only,
+        audio_mix_to_mono: cfg.audio.mix_to_mono,
+        color_brightness: cfg.display.color_brightness,
+        color_contrast: cfg.display.color_contrast,
+        color_saturation: cfg.display.color_saturation,
+        color_hue_deg: cfg.display.color_hue_deg,
+        custom_aspect: if cfg.display.use_custom_aspect {
+            Some((cfg.display.custom_aspect_w, cfg.display.custom_aspect_h))
+        } else {
+            None
+        },
+        zoom: cfg.display.zoom,
+        pan_x: cfg.display.pan_x,
+        pan_y: cfg.display.pan_y,
+        crt_strength: cfg.display.crt_strength,
     }
 }
 
 /// Snapshot the runtime state back into a `Config` shape for saving.
+/// Existing colour presets are preserved through `prior_presets` because
+/// they live only in the persisted config, not in the live `Settings`.
 pub fn config_from_runtime(
     s: &Settings,
     capture: &CaptureConfig,
     audio: &AudioConfig,
+    prior_presets: Vec<ColorPreset>,
 ) -> Config {
+    let (use_aspect, aw, ah) = match s.custom_aspect {
+        Some((w, h)) => (true, w, h),
+        None => (false, 4, 3),
+    };
     Config {
         language: s.language,
         display: DisplayConfig {
@@ -251,6 +324,18 @@ pub fn config_from_runtime(
             show_stats: s.show_stats,
             background_color: s.background_color,
             present_mode: s.present_mode,
+            color_brightness: s.color_brightness,
+            color_contrast: s.color_contrast,
+            color_saturation: s.color_saturation,
+            color_hue_deg: s.color_hue_deg,
+            crt_strength: s.crt_strength,
+            custom_aspect_w: aw,
+            custom_aspect_h: ah,
+            use_custom_aspect: use_aspect,
+            zoom: s.zoom,
+            pan_x: s.pan_x,
+            pan_y: s.pan_y,
+            color_presets: prior_presets,
         },
         monitor: MonitorConfig {
             fullscreen: s.fullscreen,
@@ -262,6 +347,7 @@ pub fn config_from_runtime(
             jpeg_quality: s.jpeg_quality,
             port: s.relay_port,
             autostart: s.relay_autostart,
+            localhost_only: s.relay_localhost_only,
         },
         capture: capture.clone(),
         audio: audio.clone(),

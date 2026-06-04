@@ -1,7 +1,9 @@
 use crate::audio::AudioRuntime;
 use crate::capture::{CaptureController, CaptureRequest};
+use crate::frame::FrameData;
 use crate::i18n::{self, Language};
 use crate::perf::PerfMetrics;
+use crate::record::{self, Recorder, RecordingHandle};
 use crate::relay::RelayInfo;
 use crate::settings::PresentMode;
 use std::sync::atomic::Ordering;
@@ -14,7 +16,7 @@ use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Icon, Window, WindowId, WindowLevel};
@@ -56,6 +58,10 @@ pub fn run(
         pending_capture: None,
         applied_window: AppliedWindow::default(),
         relay_error: Arc::new(Mutex::new(None)),
+        record: RecordingHandle::new(),
+        ctrl_held: false,
+        last_new_frame_at: None,
+        last_bright_frame_at: None,
     };
     event_loop.run_app(&mut app).context("event loop exited with error")?;
     Ok(())
@@ -86,6 +92,18 @@ struct App {
     /// Last error from a relay start attempt, surfaced in the F1 panel so
     /// the user does not have to dig through the log for a port collision.
     relay_error: Arc<Mutex<Option<String>>>,
+    /// Active recording (if any) plus last saved files for the panel.
+    record: Arc<RecordingHandle>,
+    /// Tracks whether a Ctrl modifier is currently held so wheel events can
+    /// switch between "scroll the egui panel" and "zoom the picture".
+    ctrl_held: bool,
+    /// Wall-clock moment of the last NEW frame (seq advanced).
+    last_new_frame_at: Option<Instant>,
+    /// Wall-clock moment of the last frame that was visibly bright enough
+    /// to be a real signal. Cheap cards keep emitting fresh-stamped black
+    /// frames when the console is asleep; tracking the last bright frame
+    /// is what actually catches a sleeping console.
+    last_bright_frame_at: Option<Instant>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -128,9 +146,26 @@ struct Gpu {
     /// knows what to draw. Reset when the frame size changes.
     active: ActivePipeline,
     vertex_buffer: wgpu::Buffer,
+    /// Shared uniform that carries colour, zoom/pan and CRT-scanline params
+    /// to both fragment shaders. Lives in its own bind group (group 1) so
+    /// the texture-bearing bind groups (group 0) stay separate per pipeline.
+    params_buffer: wgpu::Buffer,
+    params_bind_group: wgpu::BindGroup,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+}
+
+/// Shader-side params packed into vec4s for safe std140 alignment.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, Default)]
+struct ShaderParams {
+    /// brightness, contrast, saturation, hue_deg
+    color: [f32; 4],
+    /// zoom, pan_x, pan_y, crt_strength
+    transform: [f32; 4],
+    /// image_height (for scanline math), _, _, _
+    extra: [f32; 4],
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +196,60 @@ struct Vertex {
     uv: [f32; 2],
 }
 
-const RGB_SHADER: &str = r#"
+/// WGSL block shared by both pipelines. Defines the params uniform and the
+/// helpers that apply zoom/pan, colour adjustments and CRT scanlines. The
+/// per-pipeline shaders prepend their own texture bindings and main entries.
+const COMMON_WGSL: &str = r#"
+struct Params {
+    color: vec4<f32>,     // brightness, contrast, saturation, hue_deg
+    transform: vec4<f32>, // zoom, pan_x, pan_y, crt_strength
+    extra: vec4<f32>,     // image_height, _, _, _
+};
+@group(1) @binding(0) var<uniform> params: Params;
+
+fn apply_zoom(uv: vec2<f32>) -> vec2<f32> {
+    let zoom = max(params.transform.x, 0.01);
+    let pan = vec2<f32>(params.transform.y, params.transform.z);
+    // Zoom around the visible centre, then shift by pan.
+    return (uv - vec2<f32>(0.5, 0.5)) / zoom + vec2<f32>(0.5, 0.5) + pan;
+}
+
+fn hue_rotate(rgb: vec3<f32>, deg: f32) -> vec3<f32> {
+    let a = deg * 3.14159265 / 180.0;
+    let c = cos(a);
+    let s = sin(a);
+    // YIQ-ish hue rotation matrix that preserves luminance.
+    let m = mat3x3<f32>(
+        vec3<f32>(0.299 + 0.701 * c + 0.168 * s, 0.587 - 0.587 * c + 0.330 * s, 0.114 - 0.114 * c - 0.497 * s),
+        vec3<f32>(0.299 - 0.299 * c - 0.328 * s, 0.587 + 0.413 * c + 0.035 * s, 0.114 - 0.114 * c + 0.292 * s),
+        vec3<f32>(0.299 - 0.300 * c + 1.250 * s, 0.587 - 0.588 * c - 1.050 * s, 0.114 + 0.886 * c - 0.203 * s),
+    );
+    return m * rgb;
+}
+
+fn apply_color(rgb: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    var col = rgb;
+    // Hue first (operates in linear-ish gamma space, good enough for capture).
+    if (abs(params.color.w) > 0.0001) {
+        col = hue_rotate(col, params.color.w);
+    }
+    // Saturation: lerp between luminance and full colour.
+    let lum = dot(col, vec3<f32>(0.299, 0.587, 0.114));
+    col = mix(vec3<f32>(lum, lum, lum), col, params.color.z);
+    // Contrast around 0.5 grey, then brightness shift.
+    col = (col - 0.5) * params.color.y + 0.5 + params.color.x;
+    // CRT scanlines: darken every other source-pixel row by strength.
+    let crt = params.transform.w;
+    if (crt > 0.001 && params.extra.x > 0.0) {
+        let row = uv.y * params.extra.x;
+        let line = 0.5 + 0.5 * cos(row * 3.14159265 * 2.0);
+        col = col * mix(1.0, line, crt);
+    }
+    return clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+"#;
+
+const RGB_SHADER_HEAD: &str = r#"
 struct VsIn {
     @location(0) pos: vec2<f32>,
     @location(1) uv:  vec2<f32>,
@@ -183,7 +271,10 @@ fn vs_main(in: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(tex, samp, in.uv);
+    let uv2 = apply_zoom(in.uv);
+    let rgb = textureSample(tex, samp, uv2).rgb;
+    let adj = apply_color(rgb, in.uv);
+    return vec4<f32>(adj, 1.0);
 }
 "#;
 
@@ -193,7 +284,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 /// sRGB-aware surface storage matches the RGB pipeline. Without the gamma
 /// step the colours come out washed because the surface re-applies a sRGB
 /// curve on linear-treated gamma-encoded data.
-const NV12_SHADER: &str = r#"
+const NV12_SHADER_HEAD: &str = r#"
 struct VsIn {
     @location(0) pos: vec2<f32>,
     @location(1) uv:  vec2<f32>,
@@ -224,17 +315,17 @@ fn srgb_to_linear(c: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let y = textureSample(y_tex, samp, in.uv).r;
-    let uv = textureSample(uv_tex, samp, in.uv).rg;
-    // BT.709 limited range YUV -> sRGB-encoded RGB
+    let uv2 = apply_zoom(in.uv);
+    let y = textureSample(y_tex, samp, uv2).r;
+    let uv = textureSample(uv_tex, samp, uv2).rg;
     let yt = (y - 16.0 / 255.0) * (255.0 / 219.0);
     let ut = (uv.r - 128.0 / 255.0) * (255.0 / 224.0);
     let vt = (uv.g - 128.0 / 255.0) * (255.0 / 224.0);
     let r = yt + 1.5748 * vt;
     let g = yt - 0.1873 * ut - 0.4681 * vt;
     let b = yt + 1.8556 * ut;
-    // Decode sRGB to linear; the sRGB-aware surface will re-encode on store.
-    return vec4<f32>(srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0);
+    let adj = apply_color(vec3<f32>(r, g, b), in.uv);
+    return vec4<f32>(srgb_to_linear(adj.r), srgb_to_linear(adj.g), srgb_to_linear(adj.b), 1.0);
 }
 "#;
 
@@ -287,6 +378,29 @@ impl ApplicationHandler<UiEvent> for App {
                 if let Some(gpu) = self.gpu.as_ref() {
                     gpu.window.request_redraw();
                 }
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Park the event loop on a 1Hz heartbeat so the No-Signal overlay
+        // still appears when the capture thread has gone silent (no
+        // FrameReady events). Important: do NOT request_redraw here -
+        // that would create a tight render loop the moment the redraw
+        // completes and about_to_wait fires again, pinning the GPU.
+        // The redraw is requested only in new_events when the heartbeat
+        // wake-up actually fires.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + std::time::Duration::from_secs(1),
+        ));
+    }
+
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        // The heartbeat timer just expired - draw exactly one frame so the
+        // No-Signal overlay can update its visibility state.
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            if let Some(gpu) = self.gpu.as_ref() {
+                gpu.window.request_redraw();
             }
         }
     }
@@ -346,20 +460,88 @@ impl ApplicationHandler<UiEvent> for App {
                 },
                 ..
             } => {
-                // Esc leaves fullscreen so the user always has a way out.
                 let mut s = self.settings.lock();
                 if s.fullscreen {
                     s.fullscreen = false;
                     gpu.window.request_redraw();
                 }
             }
+            WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    state: ElementState::Pressed,
+                    physical_key: PhysicalKey::Code(KeyCode::F9),
+                    repeat: false,
+                    ..
+                },
+                ..
+            } => {
+                take_screenshot(&self.shared, &self.record);
+                gpu.window.request_redraw();
+            }
+            WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    state: ElementState::Pressed,
+                    physical_key: PhysicalKey::Code(KeyCode::F10),
+                    repeat: false,
+                    ..
+                },
+                ..
+            } => {
+                toggle_recording(&self.capture, &self.record);
+                gpu.window.request_redraw();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Ctrl + wheel = zoom in / out around the centre. Without
+                // Ctrl we leave the event alone so egui can scroll the panel.
+                if self.ctrl_held {
+                    let dy = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 30.0,
+                    };
+                    let mut s = self.settings.lock();
+                    let new_zoom = (s.zoom * (1.0 + dy * 0.1)).clamp(0.2, 8.0);
+                    s.zoom = new_zoom;
+                    gpu.window.request_redraw();
+                }
+            }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.ctrl_held = mods.state().control_key();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: winit::event::MouseButton::Right,
+                ..
+            } => {
+                // Right-click anywhere on the preview resets zoom + pan.
+                let mut s = self.settings.lock();
+                s.zoom = 1.0;
+                s.pan_x = 0.0;
+                s.pan_y = 0.0;
+                gpu.window.request_redraw();
+            }
             WindowEvent::RedrawRequested => {
                 let mut last_captured: Option<std::time::Instant> = None;
+                // True only when this redraw was driven by a brand-new frame
+                // from the capture thread. Used to decide whether to feed
+                // the latency tracker - heartbeat-driven redraws would
+                // otherwise push the "frame age at present" up artificially.
+                let mut new_frame_this_tick = false;
                 if let Some(f) = self.shared.get() {
                     last_captured = Some(f.captured_at);
                     if f.seq != self.last_seq {
                         self.last_seq = f.seq;
+                        self.last_new_frame_at = Some(Instant::now());
+                        new_frame_this_tick = true;
                         upload_frame(gpu, &f, &mut self.tex_size);
+                        // Feed the active recorder if one is running. We do
+                        // this on the redraw path so we never push the same
+                        // frame twice; capture rate gates everything else
+                        // and the render gates this.
+                        if self.record.is_recording() {
+                            if let FrameData::Nv12(bytes) = &f.data {
+                                self.record.push_frame(bytes.as_ref());
+                            }
+                        }
                         self.frames_since_log += 1;
                     }
                 }
@@ -380,6 +562,9 @@ impl ApplicationHandler<UiEvent> for App {
                     &self.relay,
                     &self.shared_for_relay,
                     &self.relay_error,
+                    last_captured,
+                    self.last_new_frame_at,
+                    self.last_bright_frame_at,
                 ) {
                     log::warn!("render: {e:#}");
                 }
@@ -387,15 +572,105 @@ impl ApplicationHandler<UiEvent> for App {
                 *self.settings.lock() = settings;
                 self.pending_capture = pending;
 
-                // End-to-end latency: how old was the frame we just presented.
-                if let Some(ts) = last_captured {
-                    self.metrics.latency.record_pipeline(ts.elapsed());
+                // End-to-end latency: how old was the frame we just
+                // presented. Only feed the tracker on real new-frame redraws
+                // - heartbeat redraws would otherwise pollute the EMA with
+                // huge values when the capture is idle.
+                if new_frame_this_tick {
+                    if let Some(ts) = last_captured {
+                        self.metrics.latency.record_pipeline(ts.elapsed());
+                    }
                 }
 
                 tick_fps_log(&mut self.last_log, &mut self.frames_since_log, &mut self.preview_fps);
             }
             _ => {}
         }
+    }
+}
+
+/// Cheap luminance estimate. Sample ~64 evenly-spaced Y-plane bytes (NV12) or
+/// luma-equivalents (RGB) and check whether their average crosses a small
+/// threshold. Used to distinguish "real signal that happens to be dark" from
+/// "console asleep, every pixel near zero". 64 samples cost a few hundred ns
+/// per frame, negligible at 60 fps.
+fn frame_appears_bright(f: &crate::frame::Frame) -> bool {
+    const SAMPLES: usize = 64;
+    const THRESHOLD: u32 = 12; // out of 255
+    match &f.data {
+        crate::frame::FrameData::Nv12(bytes) => {
+            let y_len = (f.width as usize) * (f.height as usize);
+            let len = y_len.min(bytes.len());
+            if len < SAMPLES {
+                return false;
+            }
+            let step = len / SAMPLES;
+            let mut sum: u32 = 0;
+            for i in 0..SAMPLES {
+                sum += bytes[i * step] as u32;
+            }
+            sum / SAMPLES as u32 > THRESHOLD
+        }
+        crate::frame::FrameData::Rgb(bytes) => {
+            // 4 bytes per pixel (RGBA).
+            let pixel_count = bytes.len() / 4;
+            if pixel_count < SAMPLES {
+                return false;
+            }
+            let step = pixel_count / SAMPLES;
+            let mut sum: u32 = 0;
+            for i in 0..SAMPLES {
+                let base = i * step * 4;
+                let r = bytes[base] as u32;
+                let g = bytes[base + 1] as u32;
+                let b = bytes[base + 2] as u32;
+                // BT.601 luma approximation, good enough for darkness check.
+                sum += (r * 299 + g * 587 + b * 114) / 1000;
+            }
+            sum / SAMPLES as u32 > THRESHOLD
+        }
+    }
+}
+
+fn take_screenshot(shared: &SharedFrame, handle: &RecordingHandle) {
+    let Some(frame) = shared.get() else {
+        log::warn!("no frame available for screenshot");
+        return;
+    };
+    let dir = record::default_output_dir();
+    match record::save_screenshot(&frame, &dir) {
+        Ok(path) => {
+            log::info!("screenshot saved: {}", path.display());
+            *handle.last_screenshot.lock() = Some(path);
+        }
+        Err(e) => log::error!("screenshot failed: {e:#}"),
+    }
+}
+
+fn toggle_recording(capture: &Arc<CaptureController>, handle: &RecordingHandle) {
+    let mut guard = handle.inner.lock();
+    if let Some(rec) = guard.take() {
+        drop(guard);
+        let path = rec.stop();
+        log::info!("recording stopped: {}", path.display());
+        *handle.last_recording.lock() = Some(path);
+        return;
+    }
+    let cur = capture.state.current.lock().clone();
+    let (w, h, fps) = match cur {
+        Some(c) => (c.resolution().width(), c.resolution().height(), c.frame_rate().max(1)),
+        None => {
+            log::warn!("cannot record: no active capture mode yet");
+            return;
+        }
+    };
+    let dir = record::default_output_dir();
+    match Recorder::start(w, h, fps, &dir) {
+        Ok(rec) => {
+            log::info!("recording started ({}x{} @ {} fps)", w, h, fps);
+            *guard = Some(rec);
+        }
+        Err(e) => log::error!("recording start failed: {e:#}"),
     }
 }
 
@@ -470,13 +745,44 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
     };
     surface.configure(&device, &config);
 
+    let rgb_src = format!("{}{}", COMMON_WGSL, RGB_SHADER_HEAD);
+    let nv12_src = format!("{}{}", COMMON_WGSL, NV12_SHADER_HEAD);
     let rgb_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("vcshare-rgb-shader"),
-        source: wgpu::ShaderSource::Wgsl(RGB_SHADER.into()),
+        source: wgpu::ShaderSource::Wgsl(rgb_src.into()),
     });
     let nv12_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("vcshare-nv12-shader"),
-        source: wgpu::ShaderSource::Wgsl(NV12_SHADER.into()),
+        source: wgpu::ShaderSource::Wgsl(nv12_src.into()),
+    });
+
+    // Shared uniform for colour adjustment, zoom and CRT scanlines.
+    let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vcshare-params"),
+        size: std::mem::size_of::<ShaderParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let params_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("vcshare-params-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("vcshare-params-bg"),
+        layout: &params_bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: params_buffer.as_entire_binding(),
+        }],
     });
 
     let rgb_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -534,12 +840,12 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
 
     let rgb_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("vcshare-rgb-pl"),
-        bind_group_layouts: &[&rgb_bgl],
+        bind_group_layouts: &[&rgb_bgl, &params_bgl],
         push_constant_ranges: &[],
     });
     let nv12_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("vcshare-nv12-pl"),
-        bind_group_layouts: &[&nv12_bgl],
+        bind_group_layouts: &[&nv12_bgl, &params_bgl],
         push_constant_ranges: &[],
     });
 
@@ -593,6 +899,7 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
 
     let egui_ctx = egui::Context::default();
     install_cjk_fallback(&egui_ctx);
+    bump_panel_text_size(&egui_ctx);
     let egui_state = egui_winit::State::new(
         egui_ctx.clone(),
         egui_ctx.viewport_id(),
@@ -649,6 +956,8 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
         nv12_state: None,
         active: ActivePipeline::None,
         vertex_buffer,
+        params_buffer,
+        params_bind_group,
         egui_ctx,
         egui_state,
         egui_renderer,
@@ -832,6 +1141,9 @@ fn render_frame(
     relay: &Arc<Mutex<Option<Arc<RelayInfo>>>>,
     shared_for_relay: &SharedFrame,
     relay_error: &Arc<Mutex<Option<String>>>,
+    last_captured: Option<std::time::Instant>,
+    last_new_frame_at: Option<Instant>,
+    last_bright_frame_at: Option<Instant>,
 ) -> Result<()> {
     // Apply present-mode changes from the F1 panel by reconfiguring the
     // surface only when the chosen mode actually differs.
@@ -841,10 +1153,19 @@ fn render_frame(
         gpu.surface.configure(&gpu.device, &gpu.config);
     }
 
-    // Update vertex buffer for current fit mode.
+    // Update vertex buffer for current fit mode. When the user has forced a
+    // custom aspect ratio (4:3 for retro consoles etc.), the source ratio
+    // passed into quad_scale is overridden so the quad inside the window has
+    // the requested shape - the underlying texture still streams at its
+    // native resolution.
+    let native_src_aspect = tex_size.0.max(1) as f32 / tex_size.1.max(1) as f32;
+    let src_aspect = match settings.custom_aspect {
+        Some((w, h)) if w > 0 && h > 0 => w as f32 / h as f32,
+        _ => native_src_aspect,
+    };
     let (qx, qy) = quad_scale(
         settings.fit_mode,
-        tex_size.0.max(1) as f32 / tex_size.1.max(1) as f32,
+        src_aspect,
         gpu.config.width.max(1) as f32 / gpu.config.height.max(1) as f32,
     );
     let new_quad = quad(qx, qy);
@@ -862,10 +1183,47 @@ fn render_frame(
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
 
+    // Decide whether to show the "No signal" overlay. We check when the
+    // capture seq last advanced (not the frame timestamp): cheap MS2109 /
+    // MS2130 cards keep producing fresh-stamped black frames when the
+    // console is asleep, so timestamps stay current even though no new
+    // image data is arriving. seq stagnation is the honest signal.
+    let _ = last_bright_frame_at;
+    let _ = last_new_frame_at;
+    // Treat the signal as gone when no frame timestamp has crossed the
+    // pipeline for >1.5s. This catches the cable-yanked and capture-stopped
+    // cases. It does NOT detect "MS2109 keeps streaming fresh black frames
+    // because the console is asleep" - earlier we tried a luminance-based
+    // probe for that, but it false-positives on dark game scenes and dark
+    // home screens, so we now accept the trade-off and only show the
+    // overlay when frames truly stop arriving.
+    let no_signal = match last_captured {
+        None => true,
+        Some(ts) => ts.elapsed() > std::time::Duration::from_millis(1500),
+    };
+    let strings = crate::i18n::strings(settings.language);
+    let no_signal_text = strings.no_signal;
+
     // Build the egui UI.
     let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
     let full_output = gpu.egui_ctx.run(raw_input, |ctx| {
         build_ui(ctx, settings, settings_arc, capture_info, preview_fps, audio, capture, pending, metrics, relay, shared_for_relay, relay_error);
+        if no_signal {
+            egui::Area::new(egui::Id::new("no_signal_overlay"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .fill(egui::Color32::from_black_alpha(200))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(no_signal_text)
+                                    .color(egui::Color32::from_rgb(240, 200, 120))
+                                    .size(28.0),
+                            );
+                        });
+                });
+        }
     });
     gpu.egui_state
         .handle_platform_output(&gpu.window, full_output.platform_output);
@@ -900,6 +1258,26 @@ fn render_frame(
         a: 1.0,
     };
 
+    // Push the per-frame shader params (colour, zoom, CRT). The image height
+    // is needed by the scanline math; fall back to 1.0 when no frame yet to
+    // avoid a divide-by-zero hiccup in shader.
+    let img_h = match gpu.active {
+        ActivePipeline::Rgb => gpu.rgb_state.as_ref().map(|s| s.size.1).unwrap_or(1),
+        ActivePipeline::Nv12 => gpu.nv12_state.as_ref().map(|s| s.size.1).unwrap_or(1),
+        ActivePipeline::None => 1,
+    } as f32;
+    let params = ShaderParams {
+        color: [
+            settings.color_brightness,
+            settings.color_contrast,
+            settings.color_saturation,
+            settings.color_hue_deg,
+        ],
+        transform: [settings.zoom, settings.pan_x, settings.pan_y, settings.crt_strength],
+        extra: [img_h, 0.0, 0.0, 0.0],
+    };
+    gpu.queue.write_buffer(&gpu.params_buffer, 0, bytemuck::bytes_of(&params));
+
     {
         let mut rp = encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -922,6 +1300,7 @@ fn render_frame(
                 if let Some(state) = gpu.rgb_state.as_ref() {
                     rp.set_pipeline(&gpu.rgb_pipeline);
                     rp.set_bind_group(0, &state.bind_group, &[]);
+                    rp.set_bind_group(1, &gpu.params_bind_group, &[]);
                     rp.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
                     rp.draw(0..6, 0..1);
                 }
@@ -930,6 +1309,7 @@ fn render_frame(
                 if let Some(state) = gpu.nv12_state.as_ref() {
                     rp.set_pipeline(&gpu.nv12_pipeline);
                     rp.set_bind_group(0, &state.bind_group, &[]);
+                    rp.set_bind_group(1, &gpu.params_bind_group, &[]);
                     rp.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
                     rp.draw(0..6, 0..1);
                 }
@@ -992,10 +1372,16 @@ fn build_ui(
     }
 
     if settings.show_panel {
+        // Cap the window height to roughly 80% of the viewport so a long
+        // settings list scrolls instead of spilling off-screen.
+        let screen = ctx.screen_rect();
+        let max_h = (screen.height() * 0.85).max(300.0);
         egui::Window::new(t.window_settings)
             .default_pos(egui::pos2(20.0, 80.0))
             .resizable(false)
             .collapsible(true)
+            .max_height(max_h)
+            .vscroll(true)
             .show(ctx, |ui| {
                 egui::CollapsingHeader::new(t.section_language)
                     .default_open(true)
@@ -1064,6 +1450,84 @@ fn build_ui(
                             ui.label(t.background);
                             ui.color_edit_button_rgb(&mut settings.background_color);
                         });
+
+                        ui.separator();
+                        ui.label(egui::RichText::new(t.section_color).strong());
+                        ui.add(
+                            egui::Slider::new(&mut settings.color_brightness, -0.5..=0.5)
+                                .text(t.color_brightness),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut settings.color_contrast, 0.5..=1.8)
+                                .text(t.color_contrast),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut settings.color_saturation, 0.0..=2.0)
+                                .text(t.color_saturation),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut settings.color_hue_deg, -180.0..=180.0)
+                                .text(t.color_hue),
+                        );
+                        if ui.button(t.color_reset).clicked() {
+                            settings.color_brightness = 0.0;
+                            settings.color_contrast = 1.0;
+                            settings.color_saturation = 1.0;
+                            settings.color_hue_deg = 0.0;
+                        }
+
+                        ui.separator();
+                        ui.label(egui::RichText::new(t.section_aspect).strong());
+                        let mut use_custom = settings.custom_aspect.is_some();
+                        ui.checkbox(&mut use_custom, t.aspect_use_custom);
+                        if use_custom {
+                            let (mut aw, mut ah) = settings.custom_aspect.unwrap_or((4, 3));
+                            ui.horizontal(|ui| {
+                                ui.label(t.aspect_label);
+                                ui.add(
+                                    egui::DragValue::new(&mut aw)
+                                        .range(1..=64)
+                                        .speed(0.05),
+                                );
+                                ui.label(":");
+                                ui.add(
+                                    egui::DragValue::new(&mut ah)
+                                        .range(1..=64)
+                                        .speed(0.05),
+                                );
+                                if ui.small_button("16:9").clicked() { aw = 16; ah = 9; }
+                                if ui.small_button("4:3").clicked() { aw = 4; ah = 3; }
+                                if ui.small_button("16:10").clicked() { aw = 16; ah = 10; }
+                            });
+                            settings.custom_aspect = Some((aw, ah));
+                        } else {
+                            settings.custom_aspect = None;
+                        }
+
+                        ui.separator();
+                        ui.label(egui::RichText::new(t.section_zoom).strong());
+                        ui.add(
+                            egui::Slider::new(&mut settings.zoom, 0.2..=8.0)
+                                .text(t.zoom_factor)
+                                .logarithmic(true),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label(t.zoom_pan);
+                            ui.add(egui::Slider::new(&mut settings.pan_x, -0.5..=0.5).text("X"));
+                            ui.add(egui::Slider::new(&mut settings.pan_y, -0.5..=0.5).text("Y"));
+                        });
+                        if ui.button(t.zoom_reset).clicked() {
+                            settings.zoom = 1.0;
+                            settings.pan_x = 0.0;
+                            settings.pan_y = 0.0;
+                        }
+                        ui.small(t.zoom_hint);
+
+                        ui.separator();
+                        ui.add(
+                            egui::Slider::new(&mut settings.crt_strength, 0.0..=1.0)
+                                .text(t.crt_strength),
+                        );
                     });
 
                 egui::CollapsingHeader::new(t.section_capture)
@@ -1148,7 +1612,12 @@ fn build_ui(
                             );
                             if current.is_none() && ui.button(t.relay_start).clicked() {
                                 use std::net::SocketAddr;
-                                let addr = SocketAddr::from(([0, 0, 0, 0], settings.relay_port));
+                                let host = if settings.relay_localhost_only {
+                                    [127, 0, 0, 1]
+                                } else {
+                                    [0, 0, 0, 0]
+                                };
+                                let addr = SocketAddr::from((host, settings.relay_port));
                                 match crate::relay::spawn(
                                     addr,
                                     shared_for_relay.clone(),
@@ -1169,6 +1638,20 @@ fn build_ui(
                             }
                         });
                         ui.checkbox(&mut settings.relay_autostart, t.relay_autostart);
+                        ui.checkbox(&mut settings.relay_localhost_only, t.relay_localhost_only);
+                        // Firewall hint: if we have been running but no client
+                        // ever connected via LAN, that is almost certainly a
+                        // Windows Firewall block rather than a code bug.
+                        if let Some(info) = current.as_ref() {
+                            let active = info.active_clients.load(Ordering::Relaxed);
+                            let total = info.total_clients.load(Ordering::Relaxed);
+                            if active == 0 && total == 0 && !settings.relay_localhost_only {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 180, 90),
+                                    t.relay_firewall_hint,
+                                );
+                            }
+                        }
                         ui.separator();
                         ui.add(
                             egui::Slider::new(&mut settings.jpeg_quality, 1..=100)
@@ -1180,10 +1663,14 @@ fn build_ui(
                     .default_open(false)
                     .show(ui, |ui| {
                         let sys = metrics.system();
+                        // Throttled snapshot: the panel refreshes per frame
+                        // but these numbers only re-sample 2-3 times a second
+                        // so the digits stay readable.
+                        let (pipe_ms, cap_ms, app_cpu, fps) = metrics.display_snapshot(preview_fps);
                         ui.label(format!(
                             "{} {:>5.1} %   {} {} MB",
                             t.perf_app_cpu,
-                            metrics.cpu_percent(),
+                            app_cpu,
                             t.perf_app_ram,
                             metrics.memory_mb()
                         ));
@@ -1195,17 +1682,9 @@ fn build_ui(
                             sys.used_memory_mb,
                             sys.total_memory_mb
                         ));
-                        ui.label(format!("{} {:.1} fps", t.perf_preview, preview_fps));
-                        ui.label(format!(
-                            "{} {:.1} ms",
-                            t.perf_pipeline_latency,
-                            metrics.latency.pipeline_ms()
-                        ));
-                        ui.label(format!(
-                            "{} {:.1} ms",
-                            t.perf_capture_interval,
-                            metrics.latency.capture_interval_ms()
-                        ));
+                        ui.label(format!("{} {:.1} fps", t.perf_preview, fps));
+                        ui.label(format!("{} {:.1} ms", t.perf_pipeline_latency, pipe_ms));
+                        ui.label(format!("{} {:.1} ms", t.perf_capture_interval, cap_ms));
                     });
 
                 ui.separator();
@@ -1413,6 +1892,11 @@ fn audio_section(
     {
         state.set_delay_ms(delay);
     }
+    let mut mono = state.is_mix_to_mono();
+    if ui.checkbox(&mut mono, t.audio_mix_mono).changed() {
+        state.set_mix_to_mono(mono);
+    }
+    ui.small(t.audio_mix_mono_hint);
 }
 
 /// Returns the quad scale (x, y) in clip space for the chosen fit mode given
@@ -1438,6 +1922,23 @@ fn quad_scale(mode: FitMode, src_aspect: f32, dst_aspect: f32) -> (f32, f32) {
 }
 
 /// Try to register a CJK font with egui so Chinese / Japanese / Korean
+/// Make every egui text style a couple of points larger than its default so
+/// the F1 settings panel reads comfortably at 1080p/1440p. Called once at
+/// startup; user can still resize the OS window for DPI scaling on top.
+fn bump_panel_text_size(ctx: &egui::Context) {
+    use egui::{FontFamily, FontId, TextStyle};
+    ctx.style_mut(|style| {
+        style.text_styles = [
+            (TextStyle::Heading, FontId::new(22.0, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(16.0, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(16.0, FontFamily::Proportional)),
+            (TextStyle::Small, FontId::new(13.0, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(15.0, FontFamily::Monospace)),
+        ]
+        .into();
+    });
+}
+
 /// glyphs render. Looks for Microsoft YaHei on Windows first, falls back to
 /// other common system fonts. If none are found Chinese text shows as boxes,
 /// which is recoverable by switching the language back.

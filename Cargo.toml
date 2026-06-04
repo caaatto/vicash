@@ -1,6 +1,6 @@
 [package]
 name = "vicash"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["caaatto"]
 license = "MIT"
@@ -21,7 +21,7 @@ dialoguer = { version = "0.11", default-features = false }
 directories = "5"
 egui = "0.30"
 egui-wgpu = "0.30"
-egui-winit = { version = "0.30", default-features = false, features = ["links"] }
+egui-winit = { version = "0.30", default-features = false, features = ["clipboard", "links"] }
 nokhwa = { version = "0.10", features = ["input-msmf", "input-native"] }
 pollster = "0.4"
 ringbuf = "0.4"

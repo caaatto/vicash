@@ -12,6 +12,18 @@ pub struct PerfMetrics {
     pub memory_mb: AtomicU64,
     pub system: Mutex<SystemSnapshot>,
     pub latency: LatencyTracker,
+    /// Cached display values, refreshed at most a few times per second so
+    /// the F1 panel does not flicker faster than the eye can read.
+    display: Mutex<DisplaySnapshot>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct DisplaySnapshot {
+    pipeline_ms: f32,
+    capture_interval_ms: f32,
+    cpu_percent: f32,
+    preview_fps: f32,
+    last_refresh: Option<Instant>,
 }
 
 /// Two exponentially-smoothed float counters: end-to-end pipeline latency
@@ -47,7 +59,7 @@ impl LatencyTracker {
     pub fn record_pipeline(&self, age: Duration) {
         let ms = age.as_secs_f32() * 1000.0;
         let prev = self.pipeline_ms();
-        let next = if prev == 0.0 { ms } else { prev * 0.85 + ms * 0.15 };
+        let next = if prev == 0.0 { ms } else { prev * 0.95 + ms * 0.05 };
         self.pipeline_ms.store(next.to_bits(), Ordering::Relaxed);
     }
 
@@ -59,7 +71,7 @@ impl LatencyTracker {
         if let Some(prev) = *guard {
             let interval = now.saturating_duration_since(prev).as_secs_f32() * 1000.0;
             let cur = self.capture_interval_ms();
-            let next = if cur == 0.0 { interval } else { cur * 0.85 + interval * 0.15 };
+            let next = if cur == 0.0 { interval } else { cur * 0.95 + interval * 0.05 };
             self.capture_interval_ms.store(next.to_bits(), Ordering::Relaxed);
         }
         *guard = Some(now);
@@ -80,7 +92,28 @@ impl PerfMetrics {
             memory_mb: AtomicU64::new(0),
             system: Mutex::new(SystemSnapshot::default()),
             latency: LatencyTracker::new(),
+            display: Mutex::new(DisplaySnapshot::default()),
         })
+    }
+
+    /// Throttled view of the hot counters. Refreshes the cached values at
+    /// most every 400ms so a human can actually read the numbers in the
+    /// panel; otherwise the EMA-smoothed values still update per frame and
+    /// the displayed digits flicker faster than the eye.
+    pub fn display_snapshot(&self, preview_fps: f32) -> (f32, f32, f32, f32) {
+        let mut snap = self.display.lock();
+        let stale = snap
+            .last_refresh
+            .map(|t| t.elapsed() >= Duration::from_millis(400))
+            .unwrap_or(true);
+        if stale {
+            snap.pipeline_ms = self.latency.pipeline_ms();
+            snap.capture_interval_ms = self.latency.capture_interval_ms();
+            snap.cpu_percent = self.cpu_percent();
+            snap.preview_fps = preview_fps;
+            snap.last_refresh = Some(Instant::now());
+        }
+        (snap.pipeline_ms, snap.capture_interval_ms, snap.cpu_percent, snap.preview_fps)
     }
 
     pub fn cpu_percent(&self) -> f32 {
@@ -123,7 +156,14 @@ pub fn spawn_sampler(metrics: Arc<PerfMetrics>) {
                 *metrics.system.lock() = snapshot;
 
                 if let Some(p) = sys.process(pid) {
-                    let cpu = p.cpu_usage();
+                    // sysinfo returns CPU% in the "% of one core" convention,
+                    // so a process using two cores fully reads as 200. Task
+                    // Manager on Windows shows total-system normalized. Map
+                    // to the latter by dividing by the number of cores so
+                    // the value people compare against matches.
+                    let raw = p.cpu_usage();
+                    let cores = sys.cpus().len().max(1) as f32;
+                    let cpu = raw / cores;
                     metrics
                         .cpu_percent
                         .store(cpu.to_bits() as u64, Ordering::Relaxed);

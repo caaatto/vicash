@@ -36,6 +36,11 @@ pub struct AudioState {
     pub buffered_samples: AtomicUsize,
     pub volume_percent: AtomicU32,
     pub muted: AtomicBool,
+    /// MS2109/MS2130 quirk: the card reports a 2-channel stereo input but
+    /// only fills the left channel. When this is true the output stage
+    /// averages all input channels into one signal then broadcasts that to
+    /// every output channel, so the audio shows up on both speakers.
+    pub mix_to_mono: AtomicBool,
 }
 
 pub fn list_input_devices() -> Vec<String> {
@@ -71,6 +76,7 @@ pub fn start(input_hint: Option<&str>, delay_ms: u32) -> Result<AudioRuntime> {
         buffered_samples: AtomicUsize::new(0),
         volume_percent: AtomicU32::new(100),
         muted: AtomicBool::new(false),
+        mix_to_mono: AtomicBool::new(false),
     });
 
     let streams = build_streams(&input, &output, &state)?;
@@ -157,6 +163,14 @@ impl AudioState {
 
     pub fn set_muted(&self, m: bool) {
         self.muted.store(m, Ordering::Relaxed);
+    }
+
+    pub fn is_mix_to_mono(&self) -> bool {
+        self.mix_to_mono.load(Ordering::Relaxed)
+    }
+
+    pub fn set_mix_to_mono(&self, m: bool) {
+        self.mix_to_mono.store(m, Ordering::Relaxed);
     }
 
     fn delay_samples(&self) -> usize {
@@ -357,7 +371,11 @@ fn build_output(
                         }
                     }
                     let out_frame = &mut out[f * out_channels..(f + 1) * out_channels];
-                    map_frame(&frame_in[..in_ch_clamped], out_frame);
+                    if state.mix_to_mono.load(Ordering::Relaxed) {
+                        map_frame_mono(&frame_in[..in_ch_clamped], out_frame);
+                    } else {
+                        map_frame(&frame_in[..in_ch_clamped], out_frame);
+                    }
                 }
 
                 let gain = if state.muted.load(Ordering::Relaxed) {
@@ -378,6 +396,22 @@ fn build_output(
         )
         .context("failed to build audio output stream")?;
     Ok(stream)
+}
+
+/// Average all input channels into a single sample and broadcast it to
+/// every output channel. Use this for the MS2109/MS2130 "stereo input
+/// but only the left channel carries audio" case.
+fn map_frame_mono(in_frame: &[f32], out_frame: &mut [f32]) {
+    if in_frame.is_empty() {
+        for slot in out_frame.iter_mut() {
+            *slot = 0.0;
+        }
+        return;
+    }
+    let avg: f32 = in_frame.iter().sum::<f32>() / in_frame.len() as f32;
+    for slot in out_frame.iter_mut() {
+        *slot = avg;
+    }
 }
 
 fn map_frame(in_frame: &[f32], out_frame: &mut [f32]) {

@@ -14,6 +14,7 @@ mod i18n;
 mod mpegts;
 mod perf;
 mod preview;
+mod record;
 mod relay;
 mod settings;
 mod threadprio;
@@ -122,9 +123,31 @@ fn main() -> Result<()> {
     // Load persisted config first; CLI flags win over it on conflicts.
     let cfg = config::load();
 
-    let device_index = match cli.device.or(cfg.capture.device_index) {
-        Some(i) => i,
-        None => capture::pick_device_interactive()?,
+    // Resolve which video device to open. CLI --device wins; otherwise the
+    // persisted device name (more stable than the index across reboots);
+    // otherwise the persisted index as a last fallback; otherwise prompt.
+    let device_index = if let Some(idx) = cli.device {
+        idx
+    } else if let Some(name) = cfg.capture.device_name.as_deref() {
+        match resolve_device_by_name(name) {
+            Some(idx) => {
+                log::info!("matched persisted device name '{name}' to index {idx}");
+                idx
+            }
+            None => {
+                log::warn!(
+                    "persisted device '{name}' not found, falling back to index {}",
+                    cfg.capture.device_index.unwrap_or(0)
+                );
+                cfg.capture
+                    .device_index
+                    .unwrap_or_else(|| capture::pick_device_interactive().unwrap_or(0))
+            }
+        }
+    } else if let Some(idx) = cfg.capture.device_index {
+        idx
+    } else {
+        capture::pick_device_interactive()?
     };
 
     if cli.probe {
@@ -197,6 +220,7 @@ fn main() -> Result<()> {
                 // Apply persisted audio prefs.
                 rt.state.set_volume(cfg.audio.volume_percent);
                 rt.state.set_muted(cfg.audio.muted);
+                rt.state.set_mix_to_mono(cfg.audio.mix_to_mono);
                 if let Some(out) = cfg.audio.output_device.as_deref() {
                     if !out.is_empty() && out != rt.state.output_name() {
                         if let Err(e) = rt.set_output(out) {
@@ -222,7 +246,12 @@ fn main() -> Result<()> {
     let autostart_port = if let Some(addr) = cli.serve {
         Some(addr)
     } else if cfg.relay.autostart {
-        Some(SocketAddr::from(([0, 0, 0, 0], cfg.relay.port)))
+        let host = if cfg.relay.localhost_only {
+            [127, 0, 0, 1]
+        } else {
+            [0, 0, 0, 0]
+        };
+        Some(SocketAddr::from((host, cfg.relay.port)))
     } else {
         None
     };
@@ -239,10 +268,21 @@ fn main() -> Result<()> {
     // Background saver: snapshots the live state into a Config every second
     // and writes to disk when something changed. Keeps the UI thread free of
     // any TOML serialization or file IO.
+    // If --device was passed explicitly on the command line, treat that as
+    // a session-only override: do NOT let the config saver overwrite the
+    // persisted device_name with whatever this CLI session opened. That
+    // turns "vicash --device 1" into a one-time test, not a sticky setting.
+    let persist_device_name = cli.device.is_none();
+    // Hand the saver the existing presets so a save round-trip does not
+    // wipe them. The F1 panel mutates them via shared state when we ship
+    // preset editing in a future version; today they are read-only built-ins.
+    let initial_presets = cfg.display.color_presets.clone();
     spawn_config_saver(
         shared_settings.clone(),
         capture_ctrl.clone(),
         audio_runtime.as_ref().map(|rt| rt.state.clone()),
+        persist_device_name,
+        initial_presets,
     );
 
     match event_loop {
@@ -270,11 +310,35 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Look up the current MediaFoundation index of a device by its display
+/// name. Returns None if the device is not present right now (unplugged or
+/// renamed by a driver update).
+fn resolve_device_by_name(name: &str) -> Option<u32> {
+    let devices = capture::enumerate().ok()?;
+    devices.iter().find_map(|d| {
+        if d.human_name() == name {
+            Some(capture::index_of(d))
+        } else {
+            None
+        }
+    })
+}
+
 fn spawn_config_saver(
     settings: Arc<Mutex<settings::Settings>>,
     capture: Arc<capture::CaptureController>,
     audio: Option<Arc<audio::AudioState>>,
+    persist_device_name: bool,
+    presets: Vec<config::ColorPreset>,
 ) {
+    // Capture the existing name once so we can preserve it when CLI override
+    // forbids us from learning a new one. Loaded fresh from disk so we do
+    // not depend on the in-memory Settings layout for this niche field.
+    let preserved_name = if !persist_device_name {
+        config::load().capture.device_name
+    } else {
+        None
+    };
     let _ = std::thread::Builder::new()
         .name("config-saver".into())
         .spawn(move || {
@@ -282,7 +346,13 @@ fn spawn_config_saver(
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let cap_state = capture.state.current.lock().clone();
+                let device_name = if persist_device_name {
+                    capture.state.current_device_name.lock().clone()
+                } else {
+                    preserved_name.clone()
+                };
                 let capture_cfg = config::CaptureConfig {
+                    device_name,
                     device_index: Some(capture.last_device_index()),
                     width: cap_state.as_ref().map(|c| c.resolution().width()),
                     height: cap_state.as_ref().map(|c| c.resolution().height()),
@@ -296,6 +366,7 @@ fn spawn_config_saver(
                         volume_percent: s.volume(),
                         muted: s.is_muted(),
                         delay_ms: s.delay_ms(),
+                        mix_to_mono: s.is_mix_to_mono(),
                     },
                     None => config::AudioConfig {
                         enabled: false,
@@ -304,7 +375,7 @@ fn spawn_config_saver(
                 };
                 let snapshot = {
                     let s = settings.lock();
-                    config::config_from_runtime(&s, &capture_cfg, &audio_cfg)
+                    config::config_from_runtime(&s, &capture_cfg, &audio_cfg, presets.clone())
                 };
                 let changed = match &last_saved {
                     Some(prev) => !configs_equivalent(prev, &snapshot),
