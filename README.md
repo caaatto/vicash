@@ -27,8 +27,13 @@ vicash is built for the cheap "fake USB3" capture cards (MS2109, MS2130, generic
 - NV12 zero-copy upload: Y and UV planes go straight to GPU textures, BT.709 conversion in a shader, no CPU colour conversion
 - Borderless fullscreen + always on top + hide cursor (F11) so the window behaves like a real second monitor
 - Audio passthrough from the capture card audio device to your default output, with a live volume slider, mute, and a sync delay slider so you can match audio to picture by ear
+- **Mono mix toggle** for MS2109 / MS2130 cards that only carry audio on the left channel - averages all input channels and broadcasts to every speaker
 - Live device switching from the F1 panel: pick audio input, audio output, capture resolution and fps without restarting
-- MJPEG over HTTP relay (`--serve 0.0.0.0:7777`) so a second PC can pull the feed in OBS as a browser source
+- **Device-by-name persistence** so Windows reshuffling capture indices after a reboot does not silently swap you onto a webcam
+- Image adjustment shader: **brightness / contrast / saturation / hue** with named presets, **4:3 / 16:9 / 16:10 / custom aspect ratio** lock, **Ctrl + mouse-wheel zoom**, and a **CRT scanline** strength for retro consoles
+- **F9** screenshot to PNG, **F10** video recording to MP4 (optional `ffmpeg.exe` on PATH)
+- MJPEG over HTTP relay (`--serve 0.0.0.0:7777`) so a second PC can pull the feed in OBS as a browser source, with a **localhost-only bind toggle** for privacy on public networks
+- "No signal" overlay when frame delivery stops, so you can tell at a glance whether the cable, console or app went away
 - Honest performance dashboard: capture-to-present pipeline latency in milliseconds and capture-side frame interval, so you can see exactly which part of the chain is slow
 - Settings persist to `%APPDATA%\caaatto\vicash\config.toml` and reload on next launch
 - Three UI languages: Deutsch, English, 简体中文
@@ -46,10 +51,14 @@ vicash is built for the cheap "fake USB3" capture cards (MS2109, MS2130, generic
 |---|---|---|---|---|---|---|
 | Single .exe, no install | yes | no | no | no | zip | Unity bundle |
 | Audio passthrough with live sync slider | yes | partial | yes | no | yes (no slider) | JSON edit only |
+| MS2109 / MS2130 mono-mix audio fix | yes | no | no | no | no | no |
 | MJPEG HTTP relay | yes | no | no | no | no | no |
 | Optimised for cheap MS2109 / MS2130 cards | yes | no | no | no | partial | partial |
 | Works without vendor lock-in | yes | yes | Elgato only | yes | yes | yes |
 | Live capture device / resolution / fps switch | yes | yes | partial | partial | partial | partial |
+| Live colour adjustment with presets | yes | partial | partial | partial | no | no |
+| Custom aspect lock (4:3 retro etc.) | yes | yes | no | partial | no | no |
+| Screenshot / recording hotkey | F9 / F10 | scene-only | yes | no | no | screenshot only |
 | Pipeline latency meter in UI | yes | no | no | no | no | no |
 
 If you have an Elgato card and already run OBS, Elgato's own utility is fine. If you want one .exe that opens, shows your console, lets you tweak everything live, and tells you exactly how much latency the software is adding, vicash is the tighter fit.
@@ -59,7 +68,10 @@ If you have an Elgato card and already run OBS, Elgato's own utility is fine. If
 Inside the preview window:
 
 - `F1` opens the settings panel (Sprache, Monitor-Modus, Anzeige, Capture, Audio, Relay, Performance)
+- `F9` saves a PNG screenshot to `<Pictures>/vicash`
+- `F10` toggles MP4 video recording to the same folder (needs `ffmpeg.exe` reachable on PATH or next to `vicash.exe`)
 - `F11` toggles borderless fullscreen, `Esc` always leaves fullscreen
+- `Ctrl` + mouse-wheel zooms the picture; right-click anywhere resets zoom and pan
 
 Command line, if you prefer:
 
