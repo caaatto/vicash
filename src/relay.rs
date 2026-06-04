@@ -127,15 +127,17 @@ pub fn spawn(
     });
     let jpeg = Arc::new(SharedJpeg::new());
 
-    // Bring the H.264 + MPEG-TS pipeline up alongside the MJPEG path. On an
-    // NVENC/QSV/AMF capable machine this is basically free; the software
-    // fallback uses real CPU, so users on low-end machines may want to
-    // ignore the /stream.ts endpoint.
-    #[cfg(windows)]
-    {
-        let bitrate = 6_000_000;
-        video_stream::spawn(shared.clone(), ts.clone(), shutdown.clone(), bitrate);
-    }
+    // NOTE: The MSMF software H.264 encoder behind /stream.ts is wip and
+    // does not honour IDR / GOP requests reliably (see CLAUDE.md notes).
+    // Worse, when it was auto-spawned at every relay start the encoder
+    // ran continuously even with 0 subscribers, leaked Media Foundation
+    // buffers on long sessions, and the OS eventually returned
+    // E_OUTOFMEMORY (0x8007000E) on the next encode call, which surfaced
+    // as a fast-fail abort (Windows 0xc0000409) with no Rust panic
+    // hook to catch it. Repro on the dev machine: ~30 min of normal use
+    // with relay running. fMP4 audio+video via ffmpeg has superseded this
+    // path; keep the module compiled but stop spawning the encoder thread.
+    let _ = shutdown.clone();
 
     // One encoder thread per relay; pays the NV12 -> RGB -> JPEG cost once
     // per frame and hands the result out to every connected client unchanged.
