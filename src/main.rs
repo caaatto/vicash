@@ -1,3 +1,10 @@
+// Suppress the cmd-style console window on release builds. Debug builds
+// keep the console so `cargo run` still prints log output during dev. When
+// the release binary is invoked from a terminal (e.g. `vicash --list` in
+// PowerShell), we re-attach to the parent console at startup so CLI output
+// still ends up where the user expects it.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use parking_lot::Mutex;
@@ -95,6 +102,16 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    // With windows_subsystem = "windows" there is no console by default.
+    // If the user actually launched us from a terminal we re-attach to its
+    // console so `vicash --list` and similar CLI flags still show output.
+    // Silently no-ops when there is no parent console (e.g. double-click).
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Main thread runs the render / event loop, so raise its priority before

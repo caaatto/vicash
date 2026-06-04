@@ -1232,6 +1232,28 @@ fn render_frame(
                         });
                 });
         }
+        // Small top-right corner badge when a new release is available.
+        // Stays visible regardless of whether F1 is open so the user has
+        // an obvious cue without having to dig through menus.
+        if let crate::updater::UpdateCheck::Available(info) =
+            updater.last_check_result.lock().clone()
+        {
+            let badge = format!("{} {}  (F1)", strings.update_available, info.latest_version);
+            egui::Area::new(egui::Id::new("update_badge"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .fill(egui::Color32::from_black_alpha(200))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(badge)
+                                    .color(egui::Color32::from_rgb(220, 180, 90))
+                                    .size(16.0),
+                            );
+                        });
+                });
+        }
     });
     gpu.egui_state
         .handle_platform_output(&gpu.window, full_output.platform_output);
