@@ -80,7 +80,12 @@ impl Default for Settings {
             always_on_top: false,
             hide_cursor: true,
             language: crate::i18n::Language::default(),
-            present_mode: PresentMode::Mailbox,
+            // Immediate is the lowest-latency present mode: the finished frame
+            // goes out without waiting for the display refresh cadence, which
+            // is what a capture-card preview wants. May tear; switchable to
+            // Mailbox/Fifo in the F1 panel. Falls back automatically if the
+            // GPU/surface does not support it (see pick_present_mode).
+            present_mode: PresentMode::Immediate,
             // 7777 is rarely on the Windows excluded port range; 8080 often
             // is because Hyper-V / WSL / Docker reserve dynamic ranges that
             // collide with it. Users with a free 8080 can still pick it.

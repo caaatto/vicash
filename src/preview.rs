@@ -731,7 +731,7 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
         .find(|f| f.is_srgb())
         .unwrap_or(caps.formats[0]);
     let supported_present_modes: Vec<wgpu::PresentMode> = caps.present_modes.iter().copied().collect();
-    let present_mode = pick_present_mode(PresentMode::Mailbox, &supported_present_modes);
+    let present_mode = pick_present_mode(PresentMode::Immediate, &supported_present_modes);
     log::info!(
         "wgpu adapter: {:?}, format: {:?}, present modes: {:?}, default: {:?}",
         adapter.get_info().name,
@@ -1863,6 +1863,45 @@ fn capture_section(
             c.format()
         ));
     }
+
+    // Video source selector. The device list is queried only while the
+    // popup is open (same approach as the audio in/out dropdowns), so the
+    // common case costs nothing. Switching restarts the capture thread on
+    // the new device with its default mode. This is the only in-GUI way to
+    // change the source, so a launch that guessed wrong - or fell back to
+    // the first device because no terminal was available - is fixable here.
+    let cur_dev = capture.last_device_index();
+    let cur_name = capture
+        .state
+        .current_device_name
+        .lock()
+        .clone()
+        .unwrap_or_else(|| format!("#{cur_dev}"));
+    let mut switch_to = None;
+    ui.horizontal(|ui| {
+        ui.label(t.capture_device);
+        switch_to = cached_device_combo(ui, "capture_device", &cur_dev, &short(&cur_name), || {
+            crate::capture::enumerate()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|d| (crate::capture::index_of(&d), d.human_name()))
+                .collect()
+        });
+    });
+    if let Some(chosen_dev) = switch_to {
+        capture.restart(CaptureRequest {
+            device_index: chosen_dev,
+            width: None,
+            height: None,
+            fps: None,
+            force_mjpeg: false,
+        });
+        // Drop the staged resolution/fps so the panel re-reads them from
+        // whatever mode the new device opens with on the next frame.
+        *pending = None;
+        return;
+    }
+
     if available.is_empty() {
         return;
     }
@@ -1970,15 +2009,12 @@ fn audio_section(
 
     ui.horizontal(|ui| {
         ui.label(t.audio_in);
-        let mut chosen = in_name.clone();
-        egui::ComboBox::from_id_salt("audio_in")
-            .selected_text(short(&chosen))
-            .show_ui(ui, |ui| {
-                for name in crate::audio::list_input_devices() {
-                    ui.selectable_value(&mut chosen, name.clone(), short(&name));
-                }
-            });
-        if chosen != in_name {
+        if let Some(chosen) = cached_device_combo(ui, "audio_in", &in_name, &short(&in_name), || {
+            crate::audio::list_input_devices()
+                .into_iter()
+                .map(|n| (n.clone(), n))
+                .collect()
+        }) {
             if let Err(e) = rt.set_input(&chosen) {
                 log::warn!("input switch failed: {e:#}");
             }
@@ -1986,15 +2022,12 @@ fn audio_section(
     });
     ui.horizontal(|ui| {
         ui.label(t.audio_out);
-        let mut chosen = out_name.clone();
-        egui::ComboBox::from_id_salt("audio_out")
-            .selected_text(short(&chosen))
-            .show_ui(ui, |ui| {
-                for name in crate::audio::list_output_devices() {
-                    ui.selectable_value(&mut chosen, name.clone(), short(&name));
-                }
-            });
-        if chosen != out_name {
+        if let Some(chosen) = cached_device_combo(ui, "audio_out", &out_name, &short(&out_name), || {
+            crate::audio::list_output_devices()
+                .into_iter()
+                .map(|n| (n.clone(), n))
+                .collect()
+        }) {
             if let Err(e) = rt.set_output(&chosen) {
                 log::warn!("output switch failed: {e:#}");
             }
@@ -2175,6 +2208,51 @@ fn short(s: &str) -> String {
         let head = &s[..MAX.saturating_sub(3)];
         format!("{head}...")
     }
+}
+
+/// A device-picker combo that enumerates its options at most once every two
+/// seconds (cached in egui temp memory) instead of on every frame the popup
+/// is open. Enumerating audio devices (cpal/WASAPI) or capture devices (Media
+/// Foundation) goes through slow COM calls; doing it per-frame while the
+/// popup is open stalls the render thread into heavy frame drops and can
+/// starve the real-time audio callback. `current` is the active value;
+/// `enumerate` yields (value, label) pairs and runs only on a cache miss.
+/// Returns the newly chosen value when the selection changed, else None.
+fn cached_device_combo<T>(
+    ui: &mut egui::Ui,
+    id: &str,
+    current: &T,
+    selected_text: &str,
+    enumerate: impl FnOnce() -> Vec<(T, String)>,
+) -> Option<T>
+where
+    T: Clone + PartialEq + Send + Sync + 'static,
+{
+    type Cache<T> = (std::time::Instant, std::sync::Arc<Vec<(T, String)>>);
+    let cache_id = egui::Id::new(("devcache", id));
+    let mut sel = current.clone();
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            let now = std::time::Instant::now();
+            let cached: Option<std::sync::Arc<Vec<(T, String)>>> = ui.data_mut(|d| {
+                d.get_temp::<Cache<T>>(cache_id).and_then(|(t, l)| {
+                    (now.duration_since(t) < std::time::Duration::from_secs(2)).then_some(l)
+                })
+            });
+            let list = match cached {
+                Some(l) => l,
+                None => {
+                    let l = std::sync::Arc::new(enumerate());
+                    ui.data_mut(|d| d.insert_temp::<Cache<T>>(cache_id, (now, l.clone())));
+                    l
+                }
+            };
+            for (val, label) in list.iter() {
+                ui.selectable_value(&mut sel, val.clone(), short(label));
+            }
+        });
+    if sel != *current { Some(sel) } else { None }
 }
 
 fn quad(sx: f32, sy: f32) -> [Vertex; 6] {

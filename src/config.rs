@@ -215,7 +215,10 @@ impl Default for CaptureConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // Audio passthrough on by default so a fresh install hears the
+            // capture card without having to pass --audio. Overridable via
+            // config (enabled = false) for users who only want video.
+            enabled: true,
             input_device: None,
             output_device: None,
             volume_percent: 100,

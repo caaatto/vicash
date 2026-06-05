@@ -7,7 +7,9 @@ use nokhwa::utils::{
 };
 use nokhwa::{Camera, query};
 use parking_lot::Mutex;
+use std::io::IsTerminal;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -49,6 +51,23 @@ pub fn pick_device_interactive() -> Result<u32> {
         let only = &devices[0];
         let idx = extract_index(only);
         println!("Only one capture device, opening: [{}] {}", idx, only.human_name());
+        return Ok(idx);
+    }
+
+    // Double-clicking the GUI executable gives us no console, so the
+    // interactive prompt below cannot read a keypress and dialoguer fails
+    // with "not a terminal", killing the app before the window ever opens.
+    // When there is no terminal, fall back to the first device instead. The
+    // user can switch the source afterwards from the F1 panel's device
+    // dropdown, and the choice persists to config for the next launch.
+    if !std::io::stdin().is_terminal() {
+        let first = &devices[0];
+        let idx = extract_index(first);
+        log::warn!(
+            "no terminal for interactive selection, defaulting to device [{}] {} (change it in the F1 panel)",
+            idx,
+            first.human_name()
+        );
         return Ok(idx);
     }
 
@@ -133,17 +152,21 @@ pub enum CaptureCommand {
 pub struct CaptureController {
     pub state: Arc<CaptureState>,
     cmd_tx: Sender<CaptureCommand>,
-    device_index: u32,
+    device_index: AtomicU32,
     _handle: JoinHandle<()>,
 }
 
 impl CaptureController {
     pub fn restart(&self, req: CaptureRequest) {
+        // Track the target device so last_device_index() stays correct after
+        // a source switch (the config saver and the resolution Apply button
+        // both read it). The capture thread reopens on the next loop turn.
+        self.device_index.store(req.device_index, Ordering::Relaxed);
         let _ = self.cmd_tx.send(CaptureCommand::Restart(req));
     }
 
     pub fn last_device_index(&self) -> u32 {
-        self.device_index
+        self.device_index.load(Ordering::Relaxed)
     }
 }
 
@@ -164,7 +187,7 @@ pub fn spawn(
                 log::error!("capture thread exited: {e:#}");
             }
         })?;
-    Ok(CaptureController { state, cmd_tx, device_index: req.device_index, _handle: handle })
+    Ok(CaptureController { state, cmd_tx, device_index: AtomicU32::new(req.device_index), _handle: handle })
 }
 
 fn run(
