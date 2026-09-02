@@ -239,35 +239,38 @@ fn main() -> Result<()> {
     } else {
         cfg.audio.delay_ms
     };
-    let audio_runtime = if audio_enabled {
-        let hint = cli
+    let audio_params = audio::LaunchParams {
+        input_hint: cli
             .audio_device
-            .as_deref()
-            .or(cfg.audio.input_device.as_deref())
-            .or(video_device_name.as_deref());
-        match audio::start(hint, audio_delay) {
+            .clone()
+            .or_else(|| cfg.audio.input_device.clone())
+            .or_else(|| video_device_name.clone()),
+        delay_ms: audio_delay,
+        volume_percent: cfg.audio.volume_percent,
+        muted: cfg.audio.muted,
+        mix_to_mono: cfg.audio.mix_to_mono,
+        output_device: cfg.audio.output_device.clone(),
+    };
+    let audio_control = Arc::new(audio::AudioControl {
+        runtime: Mutex::new(None),
+        shared_state: Arc::new(Mutex::new(None)),
+        last_error: Mutex::new(None),
+        params: audio_params,
+    });
+    if audio_enabled {
+        match audio::launch(&audio_control.params) {
             Ok(rt) => {
-                // Apply persisted audio prefs.
-                rt.state.set_volume(cfg.audio.volume_percent);
-                rt.state.set_muted(cfg.audio.muted);
-                rt.state.set_mix_to_mono(cfg.audio.mix_to_mono);
-                if let Some(out) = cfg.audio.output_device.as_deref() {
-                    if !out.is_empty() && out != rt.state.output_name() {
-                        if let Err(e) = rt.set_output(out) {
-                            log::warn!("could not restore output device '{out}': {e:#}");
-                        }
-                    }
-                }
-                Some(Arc::new(rt))
+                *audio_control.shared_state.lock() = Some(rt.state.clone());
+                *audio_control.runtime.lock() = Some(Arc::new(rt));
             }
             Err(e) => {
+                // Keep the failure around for the F1 panel; the user can
+                // retry from there once the device situation is fixed.
                 log::error!("audio passthrough disabled: {e:#}");
-                None
+                *audio_control.last_error.lock() = Some(format!("{e:#}"));
             }
         }
-    } else {
-        None
-    };
+    }
 
     // Live-toggleable relay handle. Either CLI --serve or the persisted
     // autostart flag spins it up at launch; the F1 panel can start and stop
@@ -310,7 +313,8 @@ fn main() -> Result<()> {
     spawn_config_saver(
         shared_settings.clone(),
         capture_ctrl.clone(),
-        audio_runtime.as_ref().map(|rt| rt.state.clone()),
+        audio_control.shared_state.clone(),
+        cfg.audio.clone(),
         persist_device_name,
         initial_presets,
     );
@@ -331,7 +335,7 @@ fn main() -> Result<()> {
             shared,
             shared_settings,
             capture_info,
-            audio_runtime.clone(),
+            audio_control.clone(),
             capture_ctrl,
             metrics,
             relay_slot,
@@ -340,7 +344,7 @@ fn main() -> Result<()> {
     }
 
     // Keep audio alive until the preview exits.
-    drop(audio_runtime);
+    drop(audio_control);
 
     Ok(())
 }
@@ -446,7 +450,8 @@ fn resolve_device_by_name(name: &str) -> Option<u32> {
 fn spawn_config_saver(
     settings: Arc<Mutex<settings::Settings>>,
     capture: Arc<capture::CaptureController>,
-    audio: Option<Arc<audio::AudioState>>,
+    audio: Arc<Mutex<Option<Arc<audio::AudioState>>>>,
+    preserved_audio: config::AudioConfig,
     persist_device_name: bool,
     presets: Vec<config::ColorPreset>,
 ) {
@@ -477,7 +482,8 @@ fn spawn_config_saver(
                     height: cap_state.as_ref().map(|c| c.resolution().height()),
                     fps: cap_state.as_ref().map(|c| c.frame_rate()),
                 };
-                let audio_cfg = match audio.as_ref() {
+                let audio_state = audio.lock().clone();
+                let audio_cfg = match audio_state {
                     Some(s) => config::AudioConfig {
                         enabled: true,
                         input_device: Some(s.input_name()),
@@ -487,10 +493,12 @@ fn spawn_config_saver(
                         delay_ms: s.delay_ms(),
                         mix_to_mono: s.is_mix_to_mono(),
                     },
-                    None => config::AudioConfig {
-                        enabled: false,
-                        ..config::AudioConfig::default()
-                    },
+                    // No runtime this tick. Do NOT write defaults here: that
+                    // used to turn a one-off start failure (e.g. the default
+                    // output device gone because a Bluetooth headset moved
+                    // elsewhere) into a persisted enabled=false with wiped
+                    // device names. Keep whatever the config said at launch.
+                    None => preserved_audio.clone(),
                 };
                 let snapshot = {
                     let s = settings.lock();

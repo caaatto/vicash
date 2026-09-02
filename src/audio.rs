@@ -98,6 +98,50 @@ pub fn start(input_hint: Option<&str>, delay_ms: u32) -> Result<AudioRuntime> {
     })
 }
 
+/// Everything needed to (re)start the passthrough after launch. Built once
+/// in main from CLI flags plus the persisted config and handed to the F1
+/// panel, so a start that failed at boot (unplugged Bluetooth output,
+/// missing capture card, ...) is recoverable with one click instead of a
+/// config edit or a relaunch with --audio.
+pub struct LaunchParams {
+    pub input_hint: Option<String>,
+    pub delay_ms: u32,
+    pub volume_percent: u32,
+    pub muted: bool,
+    pub mix_to_mono: bool,
+    pub output_device: Option<String>,
+}
+
+/// Shared audio handle for the UI. `runtime` is None while audio is off or
+/// failed to start; `last_error` carries the failure reason so the panel can
+/// show it instead of a generic "audio off" hint. The cpal streams inside
+/// AudioRuntime are !Send, so `runtime` must only be touched from the main
+/// thread; `shared_state` is the Send-safe view handed to the config saver
+/// thread and must be updated together with `runtime`.
+pub struct AudioControl {
+    pub runtime: Mutex<Option<Arc<AudioRuntime>>>,
+    pub shared_state: Arc<Mutex<Option<Arc<AudioState>>>>,
+    pub last_error: Mutex<Option<String>>,
+    pub params: LaunchParams,
+}
+
+/// Start passthrough and apply the persisted prefs in one go. Used both by
+/// the boot path in main and by the "enable audio" button in the F1 panel.
+pub fn launch(params: &LaunchParams) -> Result<AudioRuntime> {
+    let rt = start(params.input_hint.as_deref(), params.delay_ms)?;
+    rt.state.set_volume(params.volume_percent);
+    rt.state.set_muted(params.muted);
+    rt.state.set_mix_to_mono(params.mix_to_mono);
+    if let Some(out) = params.output_device.as_deref() {
+        if !out.is_empty() && out != rt.state.output_name() {
+            if let Err(e) = rt.set_output(out) {
+                log::warn!("could not restore output device '{out}': {e:#}");
+            }
+        }
+    }
+    Ok(rt)
+}
+
 impl AudioRuntime {
     /// Swap to a different input device by name. Pre/post volume, mute and
     /// delay are preserved.

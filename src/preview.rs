@@ -1,4 +1,4 @@
-use crate::audio::AudioRuntime;
+use crate::audio::AudioControl;
 use crate::capture::{CaptureController, CaptureRequest};
 use crate::frame::FrameData;
 use crate::i18n::{self, Language};
@@ -34,7 +34,7 @@ pub fn run(
     shared: SharedFrame,
     settings: Arc<Mutex<Settings>>,
     capture_info: CaptureInfo,
-    audio: Option<Arc<AudioRuntime>>,
+    audio: Arc<AudioControl>,
     capture: Arc<CaptureController>,
     metrics: Arc<PerfMetrics>,
     relay: Arc<Mutex<Option<Arc<RelayInfo>>>>,
@@ -76,7 +76,7 @@ struct App {
     shared_for_relay: SharedFrame,
     settings: Arc<Mutex<Settings>>,
     capture_info: CaptureInfo,
-    audio: Option<Arc<AudioRuntime>>,
+    audio: Arc<AudioControl>,
     capture: Arc<CaptureController>,
     metrics: Arc<PerfMetrics>,
     relay: Arc<Mutex<Option<Arc<RelayInfo>>>>,
@@ -560,7 +560,7 @@ impl ApplicationHandler<UiEvent> for App {
                     &self.capture_info,
                     self.preview_fps,
                     self.tex_size,
-                    self.audio.as_ref(),
+                    &self.audio,
                     &self.capture,
                     &mut pending,
                     &self.metrics,
@@ -1141,7 +1141,7 @@ fn render_frame(
     capture_info: &CaptureInfo,
     preview_fps: f32,
     tex_size: (u32, u32),
-    audio: Option<&Arc<AudioRuntime>>,
+    audio: &Arc<AudioControl>,
     capture: &Arc<CaptureController>,
     pending: &mut Option<PendingCapture>,
     metrics: &Arc<PerfMetrics>,
@@ -1363,7 +1363,7 @@ fn build_ui(
     settings_arc: &Arc<Mutex<Settings>>,
     capture_info: &CaptureInfo,
     preview_fps: f32,
-    audio: Option<&Arc<AudioRuntime>>,
+    audio: &Arc<AudioControl>,
     capture: &Arc<CaptureController>,
     pending: &mut Option<PendingCapture>,
     metrics: &Arc<PerfMetrics>,
@@ -1698,7 +1698,8 @@ fn build_ui(
                             if let Some(want) = want_fmp4 {
                                 if want {
                                     let cap = capture.state.current.lock().clone();
-                                    match (cap, audio) {
+                                    let audio_rt = audio.runtime.lock().clone();
+                                    match (cap, audio_rt) {
                                         (Some(c), Some(a)) => {
                                             let w = c.resolution().width();
                                             let h = c.resolution().height();
@@ -1720,7 +1721,7 @@ fn build_ui(
                                             }
                                         }
                                         (None, _) => log::warn!("fMP4 relay needs an active capture"),
-                                        (_, None) => log::warn!("fMP4 relay needs --audio enabled"),
+                                        (_, None) => log::warn!("fMP4 relay needs audio running"),
                                     }
                                 } else if let Some(old) = info.fmp4.lock().take() {
                                     old.shutdown();
@@ -1986,13 +1987,43 @@ fn capture_section(
 fn audio_section(
     ui: &mut egui::Ui,
     t: &i18n::Strings,
-    audio: Option<&Arc<AudioRuntime>>,
+    audio: &Arc<AudioControl>,
 ) {
-    let Some(rt) = audio else {
-        ui.colored_label(
-            egui::Color32::from_rgb(180, 180, 180),
-            t.audio_off_hint,
-        );
+    let runtime = audio.runtime.lock().clone();
+    let Some(rt) = runtime else {
+        // Audio is not running. Distinguish "user turned it off" from
+        // "start failed at boot": the latter used to hide behind the same
+        // generic off hint while the real reason only landed in the log.
+        match audio.last_error.lock().as_deref() {
+            Some(err) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 130, 110),
+                    format!("{} {err}", t.audio_start_failed),
+                );
+            }
+            None => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(180, 180, 180),
+                    t.audio_off_hint,
+                );
+            }
+        }
+        // One-click recovery. Re-runs the same launch path as boot with the
+        // persisted prefs, so a fixed device situation (headset re-paired,
+        // card plugged back in) does not require a config edit or --audio.
+        if ui.button(t.audio_enable).clicked() {
+            match crate::audio::launch(&audio.params) {
+                Ok(new_rt) => {
+                    *audio.shared_state.lock() = Some(new_rt.state.clone());
+                    *audio.runtime.lock() = Some(Arc::new(new_rt));
+                    *audio.last_error.lock() = None;
+                }
+                Err(e) => {
+                    log::error!("audio enable failed: {e:#}");
+                    *audio.last_error.lock() = Some(format!("{e:#}"));
+                }
+            }
+        }
         return;
     };
     let state = &rt.state;
