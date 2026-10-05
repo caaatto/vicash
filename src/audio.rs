@@ -51,6 +51,10 @@ pub struct AudioState {
     /// Mutex inside a real-time audio callback can push WASAPI past its
     /// frame deadline and force the local speaker output to drift.
     pub relay_active: AtomicBool,
+    /// True when none of the requested inputs was found and the system
+    /// default was opened instead. The config saver then keeps the user's
+    /// stored choice rather than persisting the stand-in device.
+    pub input_is_fallback: AtomicBool,
 }
 
 pub fn list_input_devices() -> Vec<String> {
@@ -67,11 +71,12 @@ pub fn list_output_devices() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Start passthrough. `input_hint` is a substring matched against input
-/// device names (case insensitive). Pass None for system default input.
-pub fn start(input_hint: Option<&str>, delay_ms: u32) -> Result<AudioRuntime> {
+/// Start passthrough. `input_hints` are substrings matched against input
+/// device names (case insensitive), tried in order. Empty or no match opens
+/// the system default input.
+pub fn start(input_hints: &[&str], delay_ms: u32) -> Result<AudioRuntime> {
     let host = cpal::default_host();
-    let input = pick_input(&host, input_hint)?;
+    let (input, fallback) = pick_input(&host, input_hints)?;
     let output = host
         .default_output_device()
         .ok_or_else(|| anyhow!("no default audio output device"))?;
@@ -89,6 +94,7 @@ pub fn start(input_hint: Option<&str>, delay_ms: u32) -> Result<AudioRuntime> {
         mix_to_mono: AtomicBool::new(false),
         relay_sink: Mutex::new(None),
         relay_active: AtomicBool::new(false),
+        input_is_fallback: AtomicBool::new(fallback),
     });
 
     let streams = build_streams(&input, &output, &state)?;
@@ -105,6 +111,11 @@ pub fn start(input_hint: Option<&str>, delay_ms: u32) -> Result<AudioRuntime> {
 /// config edit or a relaunch with --audio.
 pub struct LaunchParams {
     pub input_hint: Option<String>,
+    /// Tried when `input_hint` matches nothing: the capture card's video
+    /// name, which its audio endpoint usually contains. Windows renames
+    /// endpoints now and then ("Digital Input" became "Digital Audio
+    /// Interface"), and the stored name alone then misses the card.
+    pub input_fallback: Option<String>,
     pub delay_ms: u32,
     pub volume_percent: u32,
     pub muted: bool,
@@ -128,7 +139,11 @@ pub struct AudioControl {
 /// Start passthrough and apply the persisted prefs in one go. Used both by
 /// the boot path in main and by the "enable audio" button in the F1 panel.
 pub fn launch(params: &LaunchParams) -> Result<AudioRuntime> {
-    let rt = start(params.input_hint.as_deref(), params.delay_ms)?;
+    let hints: Vec<&str> = [params.input_hint.as_deref(), params.input_fallback.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let rt = start(&hints, params.delay_ms)?;
     rt.state.set_volume(params.volume_percent);
     rt.state.set_muted(params.muted);
     rt.state.set_mix_to_mono(params.mix_to_mono);
@@ -154,6 +169,7 @@ impl AudioRuntime {
             .ok_or_else(|| anyhow!("no output device available"))?;
         let mut guard = self.streams.lock();
         *guard = build_streams(&input, &output, &self.state)?;
+        self.state.input_is_fallback.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -269,23 +285,29 @@ fn find_device(devices: &[cpal::Device], name: &str) -> Option<cpal::Device> {
     devices.iter().find(|d| d.name().ok().as_deref() == Some(name)).cloned()
 }
 
-fn pick_input(host: &cpal::Host, hint: Option<&str>) -> Result<cpal::Device> {
-    if let Some(needle) = hint {
-        let needle = needle.to_lowercase();
-        for d in host
+/// Returns the device and whether it is the system default stand-in.
+fn pick_input(host: &cpal::Host, hints: &[&str]) -> Result<(cpal::Device, bool)> {
+    if !hints.is_empty() {
+        let devices: Vec<cpal::Device> = host
             .input_devices()
             .context("failed to list audio inputs")?
-        {
-            if let Ok(name) = d.name() {
-                if name.to_lowercase().contains(&needle) {
-                    return Ok(d);
-                }
+            .collect();
+        for hint in hints {
+            let needle = hint.to_lowercase();
+            let hit = devices.iter().find(|d| {
+                d.name().is_ok_and(|n| n.to_lowercase().contains(&needle))
+            });
+            if let Some(d) = hit {
+                return Ok((d.clone(), false));
             }
+            log::warn!("no audio input matched '{needle}'");
         }
-        log::warn!("no audio input matched '{needle}', falling back to default");
+        log::warn!("falling back to the default audio input");
     }
-    host.default_input_device()
-        .ok_or_else(|| anyhow!("no default audio input device"))
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| anyhow!("no default audio input device"))?;
+    Ok((device, !hints.is_empty()))
 }
 
 fn build_streams(

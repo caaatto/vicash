@@ -1610,6 +1610,13 @@ fn build_ui(
                                 ui.monospace(format!("  /              {}", t.relay_endpoint_browser));
                                 ui.monospace(format!("  /stream        {}", t.relay_endpoint_stream));
                                 ui.monospace(format!("  /snapshot.jpg  {}", t.relay_endpoint_snapshot));
+                                ui.monospace(format!("  /live          {}", t.relay_endpoint_live));
+                                ui.monospace(format!("  /audio.wav     {}", t.relay_endpoint_audio));
+                                if info.audio.is_available() {
+                                    ui.label(format!("{} {}", t.relay_audio_listeners, info.audio.subscribers()));
+                                } else {
+                                    ui.colored_label(egui::Color32::from_rgb(220, 180, 90), t.relay_audio_off_hint);
+                                }
                                 ui.separator();
                                 if ui.button(t.relay_stop).clicked() {
                                     info.stop();
@@ -1653,6 +1660,7 @@ fn build_ui(
                                     addr,
                                     shared_for_relay.clone(),
                                     settings_arc.clone(),
+                                    audio.shared_state.clone(),
                                 ) {
                                     Ok(info) => {
                                         log::info!("relay started at {}/", info.lan_url);
@@ -1700,13 +1708,13 @@ fn build_ui(
                                     let cap = capture.state.current.lock().clone();
                                     let audio_rt = audio.runtime.lock().clone();
                                     match (cap, audio_rt) {
-                                        (Some(c), Some(a)) => {
+                                        (Some(c), Some(_)) => {
                                             let w = c.resolution().width();
                                             let h = c.resolution().height();
                                             let fps = c.frame_rate();
                                             match crate::fmp4_relay::Fmp4Relay::spawn(
                                                 shared_for_relay.clone(),
-                                                a.state.clone(),
+                                                info.audio.clone(),
                                                 w,
                                                 h,
                                                 fps,

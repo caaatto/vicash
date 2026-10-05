@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 mod audio;
+mod audio_relay;
 mod capture;
 mod config;
 mod fmp4_relay;
@@ -24,6 +25,7 @@ mod perf;
 mod preview;
 mod record;
 mod relay;
+mod relay_video;
 mod settings;
 mod threadprio;
 mod updater;
@@ -245,6 +247,7 @@ fn main() -> Result<()> {
             .clone()
             .or_else(|| cfg.audio.input_device.clone())
             .or_else(|| video_device_name.clone()),
+        input_fallback: video_device_name.clone(),
         delay_ms: audio_delay,
         volume_percent: cfg.audio.volume_percent,
         muted: cfg.audio.muted,
@@ -289,7 +292,12 @@ fn main() -> Result<()> {
         None
     };
     if let Some(addr) = autostart_port {
-        match relay::spawn(addr, shared.clone(), shared_settings.clone()) {
+        match relay::spawn(
+            addr,
+            shared.clone(),
+            shared_settings.clone(),
+            audio_control.shared_state.clone(),
+        ) {
             Ok(info) => {
                 log::info!("MJPEG relay live at {}/", info.lan_url);
                 *relay_slot.lock() = Some(info);
@@ -486,7 +494,11 @@ fn spawn_config_saver(
                 let audio_cfg = match audio_state {
                     Some(s) => config::AudioConfig {
                         enabled: true,
-                        input_device: Some(s.input_name()),
+                        input_device: if s.input_is_fallback.load(std::sync::atomic::Ordering::Relaxed) {
+                            preserved_audio.input_device.clone()
+                        } else {
+                            Some(s.input_name())
+                        },
                         output_device: Some(s.output_name()),
                         volume_percent: s.volume(),
                         muted: s.is_muted(),

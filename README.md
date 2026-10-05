@@ -33,6 +33,7 @@ vicash is built for the cheap "fake USB3" capture cards (MS2109, MS2130, generic
 - Image adjustment shader: **brightness / contrast / saturation / hue** with named presets, **4:3 / 16:9 / 16:10 / custom aspect ratio** lock, **Ctrl + mouse-wheel zoom**, and a **CRT scanline** strength for retro consoles
 - **F9** screenshot to PNG, **F10** video recording to MP4 (optional `ffmpeg.exe` on PATH)
 - MJPEG over HTTP relay (`--serve 0.0.0.0:7777`) so a second PC can pull the feed in OBS as a browser source, with a **localhost-only bind toggle** for privacy on public networks
+- **Video + audio over LAN, in sync, no ffmpeg**: open `/live` on a phone, tablet or second PC (or in an OBS Browser Source) and get picture and sound lined up to within a frame. Pick the quality like on YouTube, 1440p down to 360p at 60 or 30 fps
 - "No signal" overlay when frame delivery stops, so you can tell at a glance whether the cable, console or app went away
 - Honest performance dashboard: capture-to-present pipeline latency in milliseconds and capture-side frame interval, so you can see exactly which part of the chain is slow
 - **Self-updater** that checks GitHub Releases on startup and offers a one-click install + restart for new versions, so critical fixes (like the v0.1.4 DWM crash hotfix) reach you without you having to think about it
@@ -55,6 +56,7 @@ vicash is built for the cheap "fake USB3" capture cards (MS2109, MS2130, generic
 | Audio passthrough with live sync slider | yes | partial | yes | no | yes (no slider) | JSON edit only |
 | MS2109 / MS2130 mono-mix audio fix | yes | no | no | no | no | no |
 | MJPEG HTTP relay | yes | no | no | no | no | no |
+| Synced video + audio to a phone / second PC | yes | no | no | no | no | no |
 | Optimised for cheap MS2109 / MS2130 cards | yes | no | no | no | partial | partial |
 | Works without vendor lock-in | yes | yes | Elgato only | yes | yes | yes |
 | Live capture device / resolution / fps switch | yes | yes | partial | partial | partial | partial |
@@ -109,6 +111,8 @@ If you have a two-PC setup (game PC running vicash, streaming PC running OBS) an
      /              browser / OBS Browser Source
      /stream        raw MJPEG stream
      /snapshot.jpg  single JPEG frame
+     /live          video + audio in sync (phone, browser, OBS)
+     /audio.wav     audio only, not synced (VLC)
    ```
 
    The LAN IP is auto-detected. Tick **Beim nächsten Start automatisch starten** / **Start automatically on next launch** to have vicash bring the relay up on its own next time.
@@ -126,16 +130,39 @@ vicash.exe --device 0 --audio --serve 0.0.0.0:7777
 ### Streaming PC (the one running OBS)
 
 1. In OBS, add a new **Browser Source**.
-2. Untick "Local file" and paste the LAN URL from the vicash panel (e.g. `http://192.168.1.42:7777/`).
+2. Untick "Local file" and paste the LAN URL from the vicash panel with `/live` appended (e.g. `http://192.168.1.42:7777/live`). Use plain `/` instead if you only want the picture.
 3. Set the width and height to match your capture resolution (default vicash setting is 1280x720).
-4. Tick **Shutdown source when not visible** so the relay does not run when the scene is off-screen.
-5. Done. The capture feed shows up in OBS as if it were a local source.
+4. Tick **Control audio via OBS** so the console sound lands in the OBS mixer, and **Shutdown source when not visible** so the relay does not run when the scene is off-screen.
+5. Done. The capture feed shows up in OBS as if it were a local source, sound included.
 
 The Relay section in the F1 panel on the game PC shows **active clients 1** once OBS connects, which is handy for confirming the link is alive.
+
+### Watching on a phone or tablet (`/live`)
+
+Open `http://<game PC IP>:7777/live` in any browser on the same network and tap once to allow sound (browsers block audio until you touch the page; OBS does not). Picture and sound arrive together:
+
+- Video and audio carry timestamps from the same clock inside vicash. The page plays the sound and shows each frame exactly when its sound comes out of the speaker, including the device's own output latency.
+- If frames arrive late (busy WiFi, slow phone) the page holds the audio a little longer until they fit, then eases back once there is headroom.
+- The gear button (bottom right, appears when you move the mouse or tap) picks the quality: the capture resolution and everything below it down to 360p, each at 60 or 30 fps. Nothing is upscaled. The browser remembers your choice. 360p30 needs roughly a tenth of the bandwidth of 720p60.
+- Audio is sent as plain 16-bit PCM, about 1.5 Mbit/s, so there is no codec and no ffmpeg involved.
+
+URL options, combine them with `&`:
+
+| Option | Effect |
+|---|---|
+| `?q=720p30` | fixed quality, handy for OBS |
+| `?ui=0` | hide the gear button |
+| `?stats` | overlay with sync state, buffer, latency, fps and bandwidth |
+| `?buffer=40` | minimum audio buffer in ms (default 80); lower is snappier, needs steadier WiFi |
+| `?offset=50` | show the picture 50 ms later, for Bluetooth headphones that misreport their delay |
+| `?audio=0` / `?video=0` | drop one of the two |
+
+The sync uses the **Audio delay** slider from the F1 panel, the same value that lines up the local preview. If sound and picture match on the game PC, they match on the phone.
 
 ### Other consumers
 
 - Any browser on any device on the LAN: open the LAN URL and you see the feed full-screen with a tiny help overlay. Works on a phone or tablet too.
+- `http://192.168.1.42:7777/audio.wav` plays the console sound in VLC or ffplay (not synced to the picture).
 - `ffplay http://192.168.1.42:7777/stream` if you want a separate window outside OBS.
 - `curl -o frame.jpg http://192.168.1.42:7777/snapshot.jpg` to grab a single still.
 
@@ -177,9 +204,9 @@ Cheap USB capture cards leave the Media Foundation source reader locked for a fe
 
 Windows reserves dynamic ranges for Hyper-V, WSL, Docker and IIS that often swallow 8080. vicash defaults to 7777 for that reason. If even 7777 is taken, try 8181, 9090 or 5500 in the F1 panel.
 
-### Audio is local only
+### Silent `/live` page
 
-The MJPEG relay over LAN currently carries video, not audio. See [issue #1](https://github.com/caaatto/vicash/issues/1) for the state of the audio relay work.
+Tap the page once, browsers keep audio muted until you do. If it stays silent, check that audio passthrough is on in the F1 panel (the Relay section warns when it is off) and that the console is not sending its sound to Bluetooth headphones, in which case nothing reaches the HDMI output at all.
 
 ## Build from source
 

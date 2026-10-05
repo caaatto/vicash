@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::audio::AudioState;
+use crate::audio_relay::{AudioRelay, AudioSubscription};
 use crate::frame::{FrameData, SharedFrame};
 
 /// Live state shared between the ffmpeg-stdout parser and every connected
@@ -88,22 +88,17 @@ pub struct Fmp4Relay {
     pub state: Arc<BroadcastState>,
     child: Mutex<Option<Child>>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
-    /// Held so we can detach the relay sink hook from the cpal input
-    /// callback on shutdown. Without this the producer half stays alive
-    /// in `AudioState.relay_sink` forever and the input callback keeps
-    /// trying to push into a consumer that nobody is draining.
-    audio: Arc<AudioState>,
 }
 
 impl Fmp4Relay {
     /// Build a new relay. Spawns ffmpeg, two TCP listeners, three worker
     /// threads (video writer, audio writer, stdout parser). `width`,
     /// `height`, `fps` describe what the capture thread is currently
-    /// publishing; `audio` provides the live sample rate + the relay sink
-    /// hook into the cpal input callback.
+    /// publishing; `audio` is the relay's PCM fan-out, which also tells us
+    /// the live sample rate and channel count.
     pub fn spawn(
         shared_frame: SharedFrame,
-        audio: Arc<AudioState>,
+        audio: Arc<AudioRelay>,
         width: u32,
         height: u32,
         fps: u32,
@@ -126,11 +121,17 @@ impl Fmp4Relay {
             .local_addr()
             .context("could not read audio listener port")?;
 
-        let sample_rate = audio.sample_rate().max(1);
-        let in_channels = (audio.channels() as u32).max(1);
+        // Subscribe before spawning ffmpeg so the first chunk tells us the
+        // format and no samples are lost while ffmpeg starts up.
+        let mut audio_sub = audio.subscribe();
+        let first = audio_sub
+            .recv(Duration::from_secs(3))
+            .ok_or_else(|| anyhow!("no audio samples arriving from the capture input"))?;
+        let sample_rate = first.sample_rate;
+        let in_channels = first.channels as u32;
 
         log::info!(
-            "fmp4 relay: video {width}x{height}@{fps} on {video_addr}, audio f32 {sample_rate}Hz x{in_channels} on {audio_addr}"
+            "fmp4 relay: video {width}x{height}@{fps} on {video_addr}, audio s16 {sample_rate}Hz x{in_channels} on {audio_addr}"
         );
 
         let mut child = build_ffmpeg(
@@ -183,12 +184,11 @@ impl Fmp4Relay {
         drop(audio_listener);
 
         let state_a = state.clone();
-        let audio_cons = audio.install_relay_sink((sample_rate as usize) * 2 * (in_channels as usize));
         threads.push(
             std::thread::Builder::new()
                 .name("fmp4-relay-audio".into())
                 .spawn(move || {
-                    audio_writer_loop(audio_sock, audio_cons, state_a);
+                    audio_writer_loop(audio_sock, audio_sub, state_a);
                 })
                 .context("failed to spawn fmp4 audio writer thread")?,
         );
@@ -209,7 +209,6 @@ impl Fmp4Relay {
             state,
             child: Mutex::new(Some(child)),
             threads: Mutex::new(threads),
-            audio,
         })
     }
 
@@ -225,9 +224,6 @@ impl Fmp4Relay {
         for h in handles {
             let _ = h.join();
         }
-        // Detach the producer half from the cpal input callback so the
-        // hot path stops fanning out into a now-dead ringbuf.
-        self.audio.remove_relay_sink();
     }
 }
 
@@ -274,7 +270,7 @@ fn build_ffmpeg(
         "-i", &video_url,
     ]);
     cmd.args([
-        "-f", "f32le",
+        "-f", "s16le",
         "-ar", &format!("{sample_rate}"),
         "-ac", &format!("{channels}"),
         "-i", &audio_url,
@@ -371,28 +367,17 @@ fn video_writer_loop(
 
 fn audio_writer_loop(
     mut sock: TcpStream,
-    mut cons: ringbuf::HeapCons<f32>,
+    mut sub: AudioSubscription,
     state: Arc<BroadcastState>,
 ) {
-    use ringbuf::traits::Consumer;
-    let mut buf: Vec<f32> = Vec::with_capacity(4096);
     loop {
         if state.shutdown.load(Ordering::Relaxed) {
             break;
         }
-        buf.clear();
-        while let Some(s) = cons.try_pop() {
-            buf.push(s);
-            if buf.len() >= 4096 {
-                break;
-            }
-        }
-        if buf.is_empty() {
-            std::thread::sleep(Duration::from_millis(5));
+        let Some(chunk) = sub.recv(Duration::from_millis(200)) else {
             continue;
-        }
-        let bytes: &[u8] = bytemuck::cast_slice(&buf);
-        if let Err(e) = sock.write_all(bytes) {
+        };
+        if let Err(e) = sock.write_all(&chunk.pcm) {
             log::warn!("fmp4 audio writer: socket write failed: {e}");
             break;
         }
