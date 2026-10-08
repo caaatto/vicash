@@ -2244,8 +2244,11 @@ fn short(s: &str) -> String {
     if s.len() <= MAX {
         s.to_string()
     } else {
-        let head = &s[..MAX.saturating_sub(3)];
-        format!("{head}...")
+        let mut end = MAX.saturating_sub(3);
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
 }
 
