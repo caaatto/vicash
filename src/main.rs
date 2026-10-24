@@ -299,7 +299,7 @@ fn main() -> Result<()> {
             audio_control.shared_state.clone(),
         ) {
             Ok(info) => {
-                log::info!("MJPEG relay live at {}/", info.lan_url);
+                log::info!("MJPEG relay live at {}/", info.lan_urls.join("/ , "));
                 *relay_slot.lock() = Some(info);
             }
             Err(e) => log::error!("relay autostart failed: {e:#}"),

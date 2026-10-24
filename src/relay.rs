@@ -23,7 +23,10 @@ const BOUNDARY: &str = "vcshareframe";
 /// see at a glance where to point a second PC.
 pub struct RelayInfo {
     pub bind_addr: SocketAddr,
+    /// Headline LAN URL, always `lan_urls[0]`.
     pub lan_url: String,
+    /// One URL per adapter address of this PC, headline first.
+    pub lan_urls: Vec<String>,
     pub local_url: String,
     pub active_clients: AtomicUsize,
     pub total_clients: AtomicUsize,
@@ -124,7 +127,8 @@ pub fn spawn(
     let server = Server::from_listener(listener, None)
         .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
     let actual = server.server_addr().to_ip().unwrap_or(addr);
-    let lan_url = build_lan_url(actual);
+    let lan_urls = build_lan_urls(actual);
+    let lan_url = lan_urls[0].clone();
     let local_url = format!("http://127.0.0.1:{}", actual.port());
     #[cfg(windows)]
     let ts = TsBroadcaster::new();
@@ -134,6 +138,7 @@ pub fn spawn(
     let info = Arc::new(RelayInfo {
         bind_addr: actual,
         lan_url,
+        lan_urls,
         local_url,
         active_clients: AtomicUsize::new(0),
         total_clients: AtomicUsize::new(0),
@@ -204,23 +209,59 @@ fn set_listener_nodelay(listener: &TcpListener) {
 #[cfg(not(windows))]
 fn set_listener_nodelay(_listener: &TcpListener) {}
 
-fn build_lan_url(addr: SocketAddr) -> String {
+/// LAN URLs built from this PC's own adapter addresses. The first entry is
+/// the headline URL; the rest cover other adapters (e.g. a phone hotspot
+/// WLAN next to a wired NIC) so a second PC on either subnet finds it.
+fn build_lan_urls(addr: SocketAddr) -> Vec<String> {
     let port = addr.port();
     if !addr.ip().is_unspecified() {
-        return format!("http://{}", addr);
+        return vec![format!("http://{}", addr)];
     }
-    let ip = local_ip().unwrap_or_else(|| IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    if ip.is_loopback() {
-        format!("http://localhost:{port}")
-    } else {
-        format!("http://{}:{}", ip, port)
+    let ips = lan_ips();
+    if ips.is_empty() {
+        return vec![format!("http://localhost:{port}")];
     }
+    ips.into_iter()
+        .map(|ip| format!("http://{}", SocketAddr::new(ip, port)))
+        .collect()
 }
 
-fn local_ip() -> Option<IpAddr> {
+/// IPv4 addresses of this PC that other devices can reach. The adapter
+/// holding the default route goes first; every other adapter follows, so
+/// the list still works on a hotspot without internet, where the route
+/// probe fails. Loopback and 169.254.x.x (no DHCP lease) are skipped.
+fn lan_ips() -> Vec<IpAddr> {
+    let mut ips: Vec<IpAddr> = default_route_ip().into_iter().collect();
+    match if_addrs::get_if_addrs() {
+        Ok(ifaces) => {
+            for iface in ifaces {
+                let IpAddr::V4(v4) = iface.ip() else { continue };
+                if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+                    continue;
+                }
+                let ip = IpAddr::V4(v4);
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            }
+        }
+        Err(e) => log::warn!("relay: could not list network adapters: {e}"),
+    }
+    ips
+}
+
+/// Local address of the adapter the OS would use for internet traffic.
+/// connect() on UDP only picks a route, no packet is sent.
+fn default_route_ip() -> Option<IpAddr> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("8.8.8.8:80").ok()?;
-    sock.local_addr().ok().map(|a| a.ip())
+    let ip = sock.local_addr().ok()?.ip();
+    match ip {
+        IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() && !v4.is_link_local() => {
+            Some(ip)
+        }
+        _ => None,
+    }
 }
 
 fn encoder_loop(

@@ -1592,12 +1592,14 @@ fn build_ui(
                                 ));
                                 ui.separator();
                                 ui.label(t.relay_url_lan);
-                                ui.horizontal(|ui| {
-                                    ui.monospace(format!("{}/", info.lan_url));
-                                    if ui.small_button(t.relay_copy_url).clicked() {
-                                        ui.ctx().copy_text(format!("{}/", info.lan_url));
-                                    }
-                                });
+                                for url in &info.lan_urls {
+                                    ui.horizontal(|ui| {
+                                        ui.monospace(format!("{}/", url));
+                                        if ui.small_button(t.relay_copy_url).clicked() {
+                                            ui.ctx().copy_text(format!("{}/", url));
+                                        }
+                                    });
+                                }
                                 ui.label(t.relay_url_local);
                                 ui.horizontal(|ui| {
                                     ui.monospace(format!("{}/", info.local_url));
