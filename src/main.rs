@@ -15,6 +15,7 @@ mod audio;
 mod audio_relay;
 mod capture;
 mod config;
+mod ffmpeg;
 mod fmp4_relay;
 mod frame;
 #[cfg(windows)]

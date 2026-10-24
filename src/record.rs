@@ -10,7 +10,7 @@ use image::{ColorType, ImageEncoder};
 use parking_lot::Mutex;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -142,7 +142,7 @@ impl Recorder {
         ensure_dir(dir)?;
         let path = dir.join(format!("vicash_{}.mp4", timestamp()));
 
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = crate::ffmpeg::command();
         cmd.args([
             "-y",
             "-f", "rawvideo",

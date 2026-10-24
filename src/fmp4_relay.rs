@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow};
 use parking_lot::{Condvar, Mutex};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -256,7 +256,7 @@ fn build_ffmpeg(
     let gop = fps.max(1);
     let video_url = format!("tcp://{video_addr}");
     let audio_url = format!("tcp://{audio_addr}");
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::ffmpeg::command();
     cmd.args([
         "-y",
         "-loglevel", "warning",

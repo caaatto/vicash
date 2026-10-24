@@ -1723,6 +1723,7 @@ fn build_ui(
                                             ) {
                                                 Ok(r) => {
                                                     *info.fmp4.lock() = Some(Arc::new(r));
+                                                    *relay_error.lock() = None;
                                                 }
                                                 Err(e) => {
                                                     log::error!("fMP4 relay start failed: {e:#}");
@@ -1730,8 +1731,14 @@ fn build_ui(
                                                 }
                                             }
                                         }
-                                        (None, _) => log::warn!("fMP4 relay needs an active capture"),
-                                        (_, None) => log::warn!("fMP4 relay needs audio running"),
+                                        (None, _) => {
+                                            log::warn!("fMP4 relay needs an active capture");
+                                            *relay_error.lock() = Some("fMP4 relay needs an active capture".into());
+                                        }
+                                        (_, None) => {
+                                            log::warn!("fMP4 relay needs audio running");
+                                            *relay_error.lock() = Some("fMP4 relay needs audio running".into());
+                                        }
                                     }
                                 } else if let Some(old) = info.fmp4.lock().take() {
                                     old.shutdown();
@@ -1746,6 +1753,14 @@ fn build_ui(
                                 ui.label(format!("{}/player", info.local_url));
                                 ui.small(t.fmp4_hint);
                             } else {
+                                // The checkbox snaps back on a failed start, so
+                                // say why instead of leaving the user guessing.
+                                if let Some(err) = relay_error.lock().as_ref() {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(240, 130, 130),
+                                        format!("{}: {}", t.relay_error_label, err),
+                                    );
+                                }
                                 ui.small(t.fmp4_hint);
                             }
                         }
